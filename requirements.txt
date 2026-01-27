@@ -1,0 +1,6 @@
+streamlit>=1.33,<2
+pandas>=2.2
+gspread>=6.1
+google-auth>=2.33
+python-dateutil>=2.9
+plotly

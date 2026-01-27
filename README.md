@@ -21,3 +21,12 @@ If the scheduling chatbot scope changes, we may pivot to one of these alternativ
 
 - **AI-Based Academic Advisor Chatbot:** A rule-driven chatbot that helps students with course selection, prerequisite checks, and degree progress guidance (as a supplement to human advisors).
 - **Smart Campus Helpdesk Chatbot:** A chatbot that answers common questions about campus services (hours, locations, policies) using curated information and escalates complex issues appropriately.
+
+
+# OA Scheduler (Sprint 1)
+
+## Setup
+```bash
+python -m venv .venv
+# activate venv
+pip install -r requirements.txt
