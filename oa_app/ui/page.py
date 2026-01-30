@@ -18,7 +18,7 @@ def list_tabs(sheet_url: str) -> list[str]:
 
 def run() -> None:
     st.set_page_config(page_title="OA Scheduler", page_icon="🗓️", layout="wide")
-    st.title("🗓️ OA Scheduler")
+    st.title("🗓️ OA Scheduler (Sprint 1 — Jan 28)")
     st.caption("Step 1: enter your name. Step 2: select a sheet/tab.")
 
     # 1) Sheet URL
@@ -50,6 +50,10 @@ def run() -> None:
         st.subheader("Who are you?")
         oa_name_input = st.text_input("Your full name (must match hired OA list)")
 
+        st.subheader("Sheet/tab")
+        tabs = list_tabs(sheet_url)
+        active_tab = st.selectbox("Select a tab", tabs, index=0) if tabs else None
+
     # 5) Validation + store state
     canon_name = None
     if oa_name_input:
@@ -57,7 +61,15 @@ def run() -> None:
         canon_name = roster_canon_by_key.get(k)
 
     st.session_state["OA_NAME"] = canon_name
+    st.session_state["active_sheet"] = active_tab
 
     # 6) Main display (minimal)
     st.markdown("### Current selection")
     st.write("**Name:**", canon_name if canon_name else "(not recognized yet)")
+    st.write("**Tab:**", active_tab if active_tab else "(none)")
+
+    if oa_name_input and not canon_name:
+        st.info("Name not found in roster. Use the exact display name from the roster sheet.")
+
+    if canon_name and active_tab:
+        st.success("✅ Ready for Jan 29 (weekly view) — you now have name + tab selected.")
