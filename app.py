@@ -1,5 +1,8 @@
+"""Streamlit entrypoint.
+
+Keep this file tiny. All UI code lives in oa_app.ui.page.
+"""
+
 from oa_app.ui.page import run
 
-
-if __name__ == "__main__":
-    run()
+run()

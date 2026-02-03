@@ -1,11 +1,6 @@
-"""Google Sheets (gspread) integration helpers.
+"""Google Sheets (gspread) helpers.
 
-Centralizes:
-- Service-account auth (via Streamlit secrets)
-- Retry/backoff for quota / transient errors
-- Opening spreadsheets by URL
-
-This keeps UI and business logic modules free of gspread boilerplate.
+Centralizes Streamlit secrets auth + basic retry/backoff for quota bursts.
 """
 
 from __future__ import annotations
@@ -23,37 +18,44 @@ T = TypeVar("T")
 
 
 def with_backoff(fn: Callable[..., T], *args, **kwargs) -> T:
-    """Run a gspread operation with exponential backoff on transient errors."""
+    """Retry gspread calls on 429/5xx with exponential backoff + jitter."""
     base = 0.6
     for i in range(6):
         try:
             return fn(*args, **kwargs)
         except Exception as e:  # noqa: BLE001
-            status_code = getattr(getattr(e, "response", None), "status_code", None)
-
-            # gspread APIError with transient HTTP codes
-            if isinstance(e, APIError) and status_code in (429, 500, 502, 503, 504):
+            sc = getattr(getattr(e, "response", None), "status_code", None)
+            transient = isinstance(e, APIError) and sc in (429, 500, 502, 503, 504)
+            s = str(e).lower()
+            textual_quota = ("429" in s) or ("quota exceeded" in s)
+            if transient or textual_quota:
                 if i == 5:
                     raise
-                time.sleep(base * (2**i) + random.uniform(0, 0.4))
+                time.sleep(base * (2 ** i) + random.uniform(0, 0.4))
                 continue
-
-            # Some quota errors surface as generic exceptions
-            s = str(e).lower()
-            if ("429" in s or "quota exceeded" in s) and i < 5:
-                time.sleep(base * (2**i) + random.uniform(0, 0.4))
-                continue
-
             raise
+
+
+def retry_429(fn: Callable[..., T], *args, retries: int = 5, backoff: float = 0.8, **kwargs) -> T:
+    """Generic retry helper for 429 bursts on non-batch gspread ops."""
+    for i in range(retries):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:  # noqa: BLE001
+            s = str(e).lower()
+            if "429" in s or "quota exceeded" in s:
+                time.sleep(backoff * (2 ** i))
+                continue
+            raise
+    return fn(*args, **kwargs)
 
 
 @st.cache_resource(show_spinner=False)
 def get_gspread_client() -> gspread.Client:
-    creds_dict = dict(st.secrets.get("gcp_service_account", {}))  # type: ignore[arg-type]
+    creds_dict = dict(st.secrets.get("gcp_service_account", {}))  # type: ignore
     if not creds_dict:
         st.error("Missing service account in secrets (gcp_service_account).")
         st.stop()
-
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive.readonly",

@@ -4,7 +4,12 @@ from datetime import time
 DEFAULT_SHEET_URL = "https://docs.google.com/spreadsheets/d/15ZXPyZ1k2AWHpNd3WYY9XdnrY50iBpqWHIsyjmO3zd4/edit?usp=sharing"
 OA_SCHEDULE_SHEETS = ["UNH (OA and GOAs)", "MC (OA and GOAs)"]
 ROSTER_SHEET = "(Names of hired OAs)"
-ROSTER_NAME_COLUMN_HEADER = "Name (OAs)"
+ROSTER_NAME_COLUMN_HEADER = "Name (OAs/GOAs)"
+ROSTER_NAME_HEADER_ALIASES = [
+    "Name (OAs/GOAs)",
+    "Name (OAs)",
+    "Name",
+]
 AUDIT_SHEET = "Audit Log"
 LOCKS_SHEET = "_Locks"   # tiny sheet for FCFS locking
 ONCALL_SHEET_OVERRIDE = ""  # e.g., "On-Call (Fall Wk 2)"
@@ -13,7 +18,10 @@ DAY_START = time(7, 0)
 DAY_END = time(23, 59)
 OA_PREFIX = "OA:"
 GOA_PREFIX = "GOA:"
-
+SIDEBAR_DENY_TABS = [
+    ROSTER_SHEET,          # "(Names of hired OAs)" (not a schedule grid)
+    "On Call General",      # internal / non-weekly reference sheet
+]
 # ===== caching / quotas =====
 DAY_CACHE_TTL_SEC = 20  # day-column cache lifetime
 HEADER_MAX_COLS = 80
