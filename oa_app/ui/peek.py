@@ -13,38 +13,25 @@ def peek_exact(schedule, tab_titles: list[str]):
     with st.expander("Peek (exactly as in sheet)"):
         tab = st.selectbox("Campus tab", tab_titles, index=0, key="peek_tab_raw")
         info = schedule._get_sheet(tab.split()[0])
-        view_mode = st.radio("View", ["Selected day", "All days"], horizontal=True, key="peek_view_raw")
-        max_rows = st.number_input("Max rows to show (0 = all)", min_value=0, value=0, step=1, key="peek_rows_raw")
+        # For now, keep Peek simple: always show all weekdays and all rows.
+        # (Removed View / Day / Max rows filters to match the current sprint UI.)
 
         total_rows = info.ws.row_count or 2000
         start_r = 2 if total_rows >= 2 else 1
         end_r = total_rows
 
-        if view_mode == "Selected day":
-            day = st.selectbox("Day", [d.title() for d in sorted(info.header_map.keys())], key="peek_day_raw")
-            if day.lower() not in info.header_map:
-                st.info("Could not find that day in this worksheet.")
-            else:
-                cols = [1, info.header_map[day.lower()]]
-                data = read_cols_exact(info.ws, start_r, end_r, cols)
-                out_time, out_day = data[1], data[cols[1]]
-                if max_rows and max_rows > 0:
-                    out_time = out_time[:max_rows]; out_day = out_day[:max_rows]
-                st.dataframe(pd.DataFrame({"Time": out_time, day.title(): out_day}), height=520, use_container_width=True)
-        else:
-            order = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"]
-            day_cols = [(d, info.header_map[d]) for d in order if d in info.header_map]
-            if not day_cols:
-                st.info("No weekday headers detected in this worksheet.")
-            else:
-                cols = [1] + [c for _, c in day_cols]
-                data = read_cols_exact(info.ws, start_r, end_r, cols)
-                out = {"Time": data[1]}
-                for d, c in day_cols:
-                    out[d.title()] = data[c]
-                if max_rows and max_rows > 0:
-                    for k in list(out.keys()): out[k] = out[k][:max_rows]
-                st.dataframe(pd.DataFrame(out), height=520, use_container_width=True)
+        order = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"]
+        day_cols = [(d, info.header_map[d]) for d in order if d in info.header_map]
+        if not day_cols:
+            st.info("No weekday headers detected in this worksheet.")
+            return
+
+        cols = [1] + [c for _, c in day_cols]
+        data = read_cols_exact(info.ws, start_r, end_r, cols)
+        out = {"Time": data[1]}
+        for d, c in day_cols:
+            out[d.title()] = data[c]
+        st.dataframe(pd.DataFrame(out), height=520, use_container_width=True)
 
 def peek_oncall(ss):
     # Multi-select viewer for any visible On-Call sheets (kept for your existing flows).
