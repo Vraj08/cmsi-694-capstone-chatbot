@@ -153,3 +153,9 @@ def is_time_token(x: str) -> time|None:
     if not s or s.lower() == "time": return None
     try: return parse_time_str(s)
     except Exception: return None
+def is_time_token(x: str) -> time|None:
+    if x is None: return None
+    s = str(x).strip()
+    if not s or s.lower() == "time": return None
+    try: return parse_time_str(s)
+    except Exception: return None

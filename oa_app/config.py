@@ -28,3 +28,4 @@ HEADER_MAX_COLS = 80
 ONCALL_MAX_COLS = 100
 ONCALL_MAX_ROWS = 1000
 HOURS_DEBUG = True   # set False to silence debug prints
+Hours = True   
