@@ -61,3 +61,8 @@ def invalidate_day_cache(info, col: int):
     ws_id = getattr(info.ws, "id", info.ws.title)
     key = (ws_id, col, info.day_min_row, info.day_max_row)
     day_cache.pop(key, None)
+def invalidate_day_cache(info, col: int):
+    day_cache = st.session_state.setdefault("DAY_CACHE", {})
+    ws_id = getattr(info.ws, "id", info.ws.title)
+    key = (ws_id, col, info.day_min_row, info.day_max_row)
+    day_cache.pop(key, None)
