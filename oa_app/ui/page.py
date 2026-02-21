@@ -22,7 +22,14 @@ from ..config import (
 from ..core.schedule import Schedule
 from ..core.utils import name_key
 from ..integrations.gspread_io import open_spreadsheet, retry_429
-from ..services.roster import load_roster, roster_maps
+from ..services.roster import load_roster, roster_maps, get_canonical_roster_name
+from ..services.hours import compute_hours_fast
+from ..services.schedule_query import (
+    get_user_schedule,
+    build_schedule_dataframe,
+    render_schedule_viz,
+    render_schedule_dataframe,
+)
 from .peek import peek_exact, peek_oncall
 
 
@@ -35,7 +42,7 @@ def list_tabs_for_sidebar(_ss) -> list[str]:
         st.error(f"Could not list worksheets: {e}")
         return []
 
-    rest = worksheets[1:]  # exclude first tab (cover)
+    rest = worksheets[1:]  
 
     deny = {
         (AUDIT_SHEET or "").strip().lower(),
@@ -86,8 +93,13 @@ def run() -> None:
     ss = open_spreadsheet(sheet_url)
     schedule = Schedule(ss)
 
+    # Make Spreadsheet handle available to other modules' caches (schedule_query).
+    st.session_state.setdefault("_SS_HANDLE_BY_ID", {})[ss.id] = ss
+
     roster = load_roster(sheet_url)
     roster_keys, _roster_canon_by_key = roster_maps(roster)
+
+    st.session_state.setdefault("HOURS_EPOCH", 0)
 
     # ---------------- Sidebar ----------------
     with st.sidebar:
@@ -99,6 +111,14 @@ def run() -> None:
             key = name_key(oa_name)
             if roster and key not in roster_keys:
                 st.info("Name not found in roster. Use the exact display name from the roster sheet.")
+            else:
+                try:
+                    canon = get_canonical_roster_name(oa_name, _roster_canon_by_key)
+                    hours_now = compute_hours_fast(ss, schedule, canon, epoch=st.session_state["HOURS_EPOCH"])
+                    st.metric("Total hours (UNH + MC + On-Call)", f"{hours_now:.1f} / 20")
+                    st.progress(min(hours_now / 20.0, 1.0))
+                except Exception as e:
+                    st.caption(f"Hours unavailable: {e}")
 
         st.divider()
 
@@ -110,6 +130,20 @@ def run() -> None:
             active_tab = st.selectbox("Select a tab", tabs, index=0, key="active_tab_select")
 
         st.session_state["active_sheet"] = active_tab
+
+    # ---------------- Schedule (graph + table) ----------------
+    with st.expander("📊 Schedule (Graph + Table)", expanded=True):
+        if not oa_name:
+            st.info("Enter a name in the sidebar to see weekly hours, schedule graph, and table.")
+        else:
+            try:
+                canon = get_canonical_roster_name(oa_name, _roster_canon_by_key)
+                user_sched = get_user_schedule(ss, schedule, canon)
+                df = build_schedule_dataframe(user_sched)
+                render_schedule_viz(st, df, title=f"{canon} — This Week")
+                render_schedule_dataframe(st, df)
+            except Exception as e:
+                st.error(f"Could not render schedule: {e}")
 
     # ---------------- Peek ----------------
     active_sheet = st.session_state.get("active_sheet")
