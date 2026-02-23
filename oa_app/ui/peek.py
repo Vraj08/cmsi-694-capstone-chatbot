@@ -47,7 +47,7 @@ def peek_exact(schedule, tab_titles: list[str]):
                 st.dataframe(pd.DataFrame(out), height=520, use_container_width=True)
 
 def peek_oncall(ss):
-
+    # Multi-select viewer for any visible On-Call sheets (kept for your existing flows).
     with st.expander("Peek On-Call (weekly sheets, as-is)"):
         try:
             all_ws = ss.worksheets()

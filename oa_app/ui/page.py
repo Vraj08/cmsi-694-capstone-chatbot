@@ -42,7 +42,7 @@ def list_tabs_for_sidebar(_ss) -> list[str]:
         st.error(f"Could not list worksheets: {e}")
         return []
 
-    rest = worksheets[1:]  
+    rest = worksheets[1:]  # exclude first tab (cover)
 
     deny = {
         (AUDIT_SHEET or "").strip().lower(),
