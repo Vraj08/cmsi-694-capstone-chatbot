@@ -34,50 +34,6 @@ from .peek import peek_exact, peek_oncall
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def list_tabs_for_sidebar(_ss) -> list[str]:
-    """Show only actual schedule tabs (UNH/MC) + weekly On-Call sheets."""
-    try:
-        worksheets = retry_429(_ss.worksheets)
-    except Exception as e:
-        st.error(f"Could not list worksheets: {e}")
-        return []
-
-    rest = worksheets[1:]  # exclude first tab (cover)
-
-    deny = {
-        (AUDIT_SHEET or "").strip().lower(),
-        (LOCKS_SHEET or "").strip().lower(),
-        *(t.strip().lower() for t in (SIDEBAR_DENY_TABS or []) if t and t.strip()),
-    }
-
-    allow_prefixes = {
-        s.split()[0].strip().lower()
-        for s in (OA_SCHEDULE_SHEETS or [])
-        if s and s.strip()
-    }
-    oncall_re = re.compile(r"\bon\s*[- ]?call\b", re.I)
-
-    def selectable(title: str) -> bool:
-        tl = (title or "").strip().lower()
-        if not tl or tl in deny:
-            return False
-        if oncall_re.search(title):
-            return True
-        first = tl.split()[0] if tl.split() else ""
-        return first in allow_prefixes
-
-    out: list[str] = []
-    for ws in rest:
-        # skip hidden sheets
-        try:
-            hidden = bool(getattr(ws, "hidden"))
-        except Exception:
-            hidden = bool(getattr(ws, "_properties", {}).get("hidden", False))
-        if hidden:
-            continue
-        if selectable(ws.title):
-            out.append(ws.title)
-    return out
 
 
 def run() -> None:
