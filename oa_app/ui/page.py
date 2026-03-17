@@ -80,6 +80,26 @@ def list_tabs_for_sidebar(_ss) -> list[str]:
     return out
 
 
+def run() -> None:
+    st.set_page_config(page_title="OA Scheduler", page_icon="🗓️", layout="wide")
+    st.title("🗓️ OA Scheduler")
+    st.caption("Connects to Google Sheets, validates your name from roster, and lets you Peek sheets as-is.")
+
+    sheet_url = st.secrets.get("SHEET_URL", DEFAULT_SHEET_URL)
+    if not sheet_url:
+        st.error("Missing SHEET_URL in secrets and no DEFAULT_SHEET_URL set.")
+        st.stop()
+
+    ss = open_spreadsheet(sheet_url)
+    schedule = Schedule(ss)
+
+    # Make Spreadsheet handle available to other modules' caches (schedule_query).
+    st.session_state.setdefault("_SS_HANDLE_BY_ID", {})[ss.id] = ss
+
+    roster = load_roster(sheet_url)
+    roster_keys, _roster_canon_by_key = roster_maps(roster)
+
+    st.session_state.setdefault("HOURS_EPOCH", 0)
 
     # ---------------- Sidebar ----------------
     with st.sidebar:
