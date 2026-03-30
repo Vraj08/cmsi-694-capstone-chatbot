@@ -25,21 +25,6 @@ from ..core.quotas import _safe_batch_get, read_day_column_map_cached
 # Debug controls (no-UI): secrets/env/session_state
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _hours_debug_enabled() -> bool:
-    """Return True if the caller explicitly enabled slow/verbose counting mode.
-    This only affects *how* we count UNH/MC (fast vs grid), not the resulting totals.
-    """
-    try:
-        if bool(st.session_state.get("HOURS_DEBUG")):
-            return True
-    except Exception:
-        pass
-    if str(os.environ.get("HOURS_DEBUG", "")).strip() not in ("", "0", "false", "False"):
-        return True
-    try:
-        return bool(st.secrets.get("hours_debug", False))
-    except Exception:
-        return False
 
 
 # ──────────────────────────────────────────────────────────────────────────────
