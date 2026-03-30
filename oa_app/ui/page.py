@@ -135,4 +135,8 @@ def list_tabs_for_sidebar(_ss) -> list[str]:
     else:
         st.info("Select a roster tab on the left to peek.")
 
-def fun:
+
+
+
+
+
