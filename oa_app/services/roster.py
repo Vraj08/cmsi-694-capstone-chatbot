@@ -12,7 +12,6 @@ from ..integrations.gspread_io import open_spreadsheet, retry_429
 
 
 
-
 def roster_maps(roster: List[str]) -> tuple[set[str], Dict[str, str]]:
     roster_keys = {name_key(n) for n in roster}
     roster_canon_by_key = {name_key(n): n for n in roster}
