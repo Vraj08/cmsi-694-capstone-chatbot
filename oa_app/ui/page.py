@@ -135,3 +135,9 @@ def list_tabs_for_sidebar(_ss) -> list[str]:
             peek_exact(schedule, [active_sheet])
     else:
         st.info("Select a roster tab on the left to peek.")
+
+
+
+
+
+
