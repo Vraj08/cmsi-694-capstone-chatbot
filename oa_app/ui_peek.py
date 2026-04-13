@@ -4,8 +4,8 @@ import re
 import gspread.utils as a1
 from datetime import datetime
 from dateutil import parser as dateparser
-from ..config import ONCALL_MAX_COLS, ONCALL_MAX_ROWS
-from ..core.quotas import read_cols_exact, _safe_batch_get
+from .config import ONCALL_MAX_COLS, ONCALL_MAX_ROWS
+from .quotas import read_cols_exact, _safe_batch_get
 
 def peek_exact(schedule, tab_titles: list[str]):
     # Renders MC/UNH style (Mon–Sun header) sheets.

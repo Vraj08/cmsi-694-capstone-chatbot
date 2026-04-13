@@ -8,7 +8,7 @@ import gspread
 from .hours import invalidate_hours_caches
 
 from .locks import get_or_create_locks_sheet, acquire_fcfs_lock, lock_key
-from ..core.utils import fmt_time
+from .utils import fmt_time
 from .hours import total_hours_from_unh_mc_and_neighbor
 from .schedule_query import (
     get_user_schedule,
