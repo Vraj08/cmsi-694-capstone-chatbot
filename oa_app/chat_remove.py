@@ -5,7 +5,7 @@ from typing import List, Optional
 import gspread
 import streamlit as st
 
-from ..core.utils import fmt_time
+from .utils import fmt_time
 from .locks import get_or_create_locks_sheet, acquire_fcfs_lock, lock_key
 from .schedule_query import (
     _TIME_CELL_RE,

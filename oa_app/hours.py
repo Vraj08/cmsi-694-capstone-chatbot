@@ -8,7 +8,7 @@ import streamlit as st
 import gspread
 import gspread.utils as a1
 
-from ..config import (
+from .config import (
     OA_SCHEDULE_SHEETS,   # ["UNH ...", "MC ..."]
     AUDIT_SHEET,
     LOCKS_SHEET,
@@ -18,7 +18,7 @@ from ..config import (
     SIDEBAR_DENY_TABS,
     ONCALL_SHEET_OVERRIDE,  # optional override of On-Call tab name
 )
-from ..core.quotas import _safe_batch_get, read_day_column_map_cached
+from .quotas import _safe_batch_get, read_day_column_map_cached
 
 
 # ──────────────────────────────────────────────────────────────────────────────

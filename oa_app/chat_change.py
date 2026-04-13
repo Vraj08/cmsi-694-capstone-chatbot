@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional, Sequence, Tuple, List
 
-from ..core.utils import fmt_time
+from .utils import fmt_time
 from .chat_add import handle_add
 from .chat_remove import handle_remove
 

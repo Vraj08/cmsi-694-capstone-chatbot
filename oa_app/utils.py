@@ -1,7 +1,7 @@
 import re
 from datetime import datetime, date, time, timedelta
 from dateutil import parser as dateparser
-from ..config import DAY_START, DAY_END
+from .config import DAY_START, DAY_END
 import re, unicodedata
 
 def collapse_spaces(s: str) -> str:
@@ -81,16 +81,9 @@ def name_key(name: str) -> str:
     return re.sub(r"\s+", " ", (name or "")).strip().lower()
 
 def normalize_campus(campus: str|None, default_campus: str) -> str:
-    if not campus:
-        d = (default_campus or "").strip()
-        dl = d.lower()
-        if "call" in dl: return "ONCALL"
-        if dl.startswith("unh") or "hall" in dl: return "UNH"
-        if dl.startswith("mc") or "main" in dl: return "MC"
-        return d.split()[0] if d else ""
+    if not campus: return default_campus.split()[0]
     c = campus.strip().lower()
-    if "call" in c: return "ONCALL"
-    if c.startswith("unh") or "hall" in c: return "UNH"
+    if c.startswith("unh"): return "UNH"
     if c.startswith("mc") or "main" in c: return "MC"
     return campus.split()[0].upper()
 
