@@ -83,6 +83,32 @@ class TradeboardTests(unittest.TestCase):
         self.assertEqual((windows[0].end - windows[0].start).total_seconds(), 5 * 3600)
         self.assertIn("Alex Smith", df.iloc[0, 1])
 
+    def test_build_callout_windows_unh_mc_counts_orange_as_called_out_time(self):
+        grid = [
+            ["Time", "Tuesday"],
+            ["9:00 AM", ""],
+            ["", "OA: Vraj Patel"],
+            ["9:30 AM", ""],
+            ["", "OA: Vraj Patel"],
+            ["10:00 AM", ""],
+        ]
+        bg = [
+            [None, None],
+            [None, None],
+            [None, {"red": 1.0, "green": 0.65, "blue": 0.0}],
+            [None, None],
+            [None, {"red": 1.0, "green": 0.65, "blue": 0.0}],
+            [None, None],
+        ]
+
+        with patch.object(pickup_scan, "_fetch_griddata", return_value=(grid, bg)):
+            windows = pickup_scan.build_callout_windows_unh_mc(object(), "UNH (OA and GOAs)", max_rows=6, max_cols=2)
+
+        self.assertEqual(len(windows), 1)
+        self.assertEqual(windows[0].target_name, "Vraj Patel")
+        self.assertEqual(windows[0].kind, "UNH")
+        self.assertEqual((windows[0].end - windows[0].start).total_seconds(), 3600)
+
 
 if __name__ == "__main__":
     unittest.main()
