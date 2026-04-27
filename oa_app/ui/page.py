@@ -1489,6 +1489,334 @@ def _find_any_conflict(
     return None
 
 
+def _extract_details_meta(details: str) -> tuple[dict, str]:
+    s = str(details or "").strip()
+    match = _META_RE.search(s)
+    if not match:
+        return {}, s
+    try:
+        meta = json.loads(match.group(1)) if match.group(1) else {}
+        if not isinstance(meta, dict):
+            meta = {}
+    except Exception:
+        meta = {}
+    rest = (s[: match.start()] + s[match.end() :]).strip()
+    if rest.startswith("|"):
+        rest = rest[1:].strip()
+    return meta, rest
+
+
+def _sheet_gid_for_title(schedule_global: Schedule, title: str) -> int | None:
+    try:
+        schedule_global._load_ws_map()  # type: ignore[attr-defined]
+        ws_map = getattr(schedule_global, "_ws_map", None) or {}
+        ws = ws_map.get(title)
+        gid = getattr(ws, "id", None)
+        if gid is None and ws is not None:
+            gid = getattr(ws, "_properties", {}).get("sheetId")
+        return int(gid) if gid is not None else None
+    except Exception:
+        return None
+
+
+def _attach_details_meta(*, details: str, campus_key: str, sheet_title: str, sheet_gid: int | None) -> str:
+    meta: dict = {
+        "campus_key": str(campus_key or "").strip().upper(),
+        "sheet_title": str(sheet_title or "").strip(),
+    }
+    if sheet_gid is not None:
+        meta["sheet_gid"] = int(sheet_gid)
+    mmdd = _MMDD_RE.findall(meta["sheet_title"])
+    if len(mmdd) >= 2:
+        meta["week_start"] = f"{mmdd[0][0]}/{mmdd[0][1]}"
+        meta["week_end"] = f"{mmdd[1][0]}/{mmdd[1][1]}"
+    prefix = "META=" + json.dumps(meta, separators=(",", ":"), ensure_ascii=False)
+    rest = str(details or "").strip()
+    return f"{prefix} | {rest}" if rest else prefix
+
+
+def _resolve_ws_title_from_meta(ss, schedule_global: Schedule, *, campus_fallback: str, details: str) -> str:
+    meta, _ = _extract_details_meta(details)
+
+    gid = meta.get("sheet_gid")
+    if gid is not None:
+        try:
+            gid_int = int(gid)
+            if hasattr(ss, "get_worksheet_by_id"):
+                ws = ss.get_worksheet_by_id(gid_int)
+                if ws is not None and getattr(ws, "title", None):
+                    return str(ws.title)
+            schedule_global._load_ws_map()  # type: ignore[attr-defined]
+            ws_map = getattr(schedule_global, "_ws_map", None) or {}
+            for title, ws in ws_map.items():
+                wid = getattr(ws, "id", None)
+                if wid is None:
+                    wid = getattr(ws, "_properties", {}).get("sheetId")
+                if wid is not None and int(wid) == gid_int:
+                    return str(title)
+        except Exception:
+            pass
+
+    sheet_title = str(meta.get("sheet_title") or "").strip()
+    if sheet_title:
+        try:
+            titles = [ws.title for ws in ss.worksheets()]
+            if sheet_title in titles:
+                return sheet_title
+        except Exception:
+            return sheet_title
+
+    campus_key = str(meta.get("campus_key") or "").strip().upper() or str(campus_fallback or "").strip()
+    wk_start = str(meta.get("week_start") or "").strip()
+    wk_end = str(meta.get("week_end") or "").strip()
+    if campus_key and wk_start and wk_end:
+        try:
+            for ws in ss.worksheets():
+                title = str(getattr(ws, "title", "") or "")
+                low = title.lower()
+                if campus_key.lower() in low and wk_start in title and wk_end in title:
+                    return title
+        except Exception:
+            pass
+
+    fallback_title, _ = chat_add_mod._resolve_campus_title(ss, campus_fallback, None)
+    return fallback_title
+
+
+def _approval_created_at_date(req: dict) -> date | None:
+    raw = str(req.get("Created", "") or "").strip()
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=LA_TZ)
+        return dt.astimezone(LA_TZ).date()
+    except Exception:
+        return None
+
+
+def _approval_created_week_fallback(req: dict, day_canon: str) -> date | None:
+    created_d = _approval_created_at_date(req)
+    if not created_d:
+        return None
+    try:
+        ws, we = _week_bounds_la(created_d)
+        return week_range_mod.date_for_weekday(ws, we, day_canon)
+    except Exception:
+        return None
+
+
+def _approval_meta_week_bounds(meta: dict, *, ref_date: date | None = None) -> tuple[date, date] | None:
+    wk_start = str((meta or {}).get("week_start") or "").strip()
+    wk_end = str((meta or {}).get("week_end") or "").strip()
+    if not (wk_start and wk_end):
+        return None
+    try:
+        return week_range_mod.week_range_from_text(
+            f"{wk_start} - {wk_end}",
+            today=ref_date or _la_today(),
+        )
+    except Exception:
+        return None
+
+
+def _approval_row_event_date(ss, req: dict) -> date | None:
+    details = str(req.get("Details", "") or "")
+    meta, details_rest = _extract_details_meta(details)
+    kv = _parse_details_kv(details_rest)
+    ds = str(kv.get("date") or "").strip()
+    if ds:
+        try:
+            return date.fromisoformat(ds)
+        except Exception:
+            pass
+
+    day_canon = re.sub(r"[^a-z]", "", str(req.get("Day", "") or "").strip().lower())
+    if not day_canon:
+        return None
+
+    campus = str(req.get("Campus", "") or "").strip()
+    campus_title = str(meta.get("sheet_title") or "").strip() or campus
+    campus_key = str(meta.get("campus_key") or "").strip().upper()
+    if not campus_key:
+        guessed = campus_kind(campus_title or campus)
+        campus_key = "ONCALL" if guessed == "ONCALL" else str(guessed or campus).upper()
+
+    created_d = _approval_created_at_date(req)
+    ref_date = created_d or _la_today()
+
+    explicit_week = None
+    if campus_title:
+        try:
+            explicit_week = week_range_mod.week_range_from_title(campus_title, today=ref_date)
+        except Exception:
+            explicit_week = None
+    if not explicit_week:
+        explicit_week = _approval_meta_week_bounds(meta, ref_date=created_d)
+    if explicit_week:
+        try:
+            got = week_range_mod.date_for_weekday(explicit_week[0], explicit_week[1], day_canon)
+            if got:
+                return got
+        except Exception:
+            pass
+
+    if campus_key == "ONCALL" and campus_title:
+        try:
+            wr = _worksheet_week_bounds(ss, campus_title)
+            if wr:
+                got = week_range_mod.date_for_weekday(wr[0], wr[1], day_canon)
+                if got:
+                    return got
+        except Exception:
+            pass
+
+    return _approval_created_week_fallback(req, day_canon)
+
+
+def _signature_time_label(value: str) -> str | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if dt.tzinfo is not None:
+        try:
+            dt = dt.astimezone(LA_TZ)
+        except Exception:
+            pass
+    return fmt_time(dt)
+
+
+def _append_my_pickups_into_sched(
+    user_sched_all: dict,
+    approvals_rows: list[dict],
+    *,
+    requester: str,
+    week_titles: set[str],
+    include_statuses: set[str] | None = None,
+    ss=None,
+    week_bounds: tuple[date, date] | None = None,
+) -> dict:
+    include_statuses = include_statuses or {"PENDING", "APPROVED"}
+    out = {
+        day_key: {bucket: list(values) for bucket, values in (buckets or {}).items()}
+        for day_key, buckets in (user_sched_all or {}).items()
+    }
+    for buckets in out.values():
+        for bucket in ("UNH", "MC", "On-Call"):
+            buckets.setdefault(bucket, [])
+
+    want_req = name_key(requester)
+    for row in approvals_rows or []:
+        action = str(row.get("Action", "") or "").strip().lower()
+        if action not in {"pickup", "cover"}:
+            continue
+        status = str(row.get("Status", "") or "").strip().upper()
+        if status not in include_statuses:
+            continue
+        if name_key(str(row.get("Requester", "") or "")) != want_req:
+            continue
+        meta, _ = _extract_details_meta(str(row.get("Details", "") or ""))
+        campus = str(row.get("Campus", "") or "").strip()
+        campus_title = str(meta.get("sheet_title") or "").strip() or campus
+        if week_titles and campus_title not in week_titles:
+            continue
+
+        event_d = _approval_row_event_date(ss, row) if ss is not None else None
+        if week_bounds and event_d and not (week_bounds[0] <= event_d <= week_bounds[1]):
+            continue
+
+        day_canon = re.sub(r"[^a-z]", "", str(row.get("Day", "") or "").strip().lower())
+        if not day_canon or day_canon not in out:
+            continue
+
+        start = str(row.get("Start", "") or "").strip()
+        end = str(row.get("End", "") or "").strip()
+        if not (start and end):
+            continue
+
+        kind = campus_kind(str(meta.get("campus_key") or "") or campus_title or campus)
+        bucket = "On-Call" if kind == "ONCALL" else kind
+        out[day_canon].setdefault(bucket, []).append((start, end))
+
+    return out
+
+
+def _request_week_bounds(ss, week_titles_map: dict[str, str | None], seed_title: str) -> tuple[date, date]:
+    for cand in [week_titles_map.get("ONCALL"), seed_title, week_titles_map.get("UNH"), week_titles_map.get("MC")]:
+        if not cand:
+            continue
+        try:
+            wr = week_range_mod.week_range_from_title(str(cand), today=_la_today())
+        except Exception:
+            wr = None
+        if not wr and campus_kind(str(cand)) == "ONCALL":
+            try:
+                wr = _worksheet_week_bounds(ss, str(cand))
+            except Exception:
+                wr = None
+        if wr:
+            return wr
+    return _week_bounds_la()
+
+
+def _day_intervals(user_sched_all: dict, day_canon: str) -> list[tuple[datetime, datetime]]:
+    intervals: list[tuple[datetime, datetime]] = []
+    buckets = (user_sched_all or {}).get(day_canon, {}) or {}
+    for bucket in ("UNH", "MC", "On-Call"):
+        for start_s, end_s in buckets.get(bucket, []) or []:
+            try:
+                start_dt = datetime.strptime(start_s, "%I:%M %p")
+                end_dt = datetime.strptime(end_s, "%I:%M %p")
+            except Exception:
+                continue
+            if end_dt <= start_dt:
+                end_dt = end_dt + timedelta(days=1)
+            intervals.append((start_dt, end_dt))
+    intervals.sort(key=lambda pair: pair[0])
+    return intervals
+
+
+def _find_any_conflict(
+    user_sched_all: dict,
+    day_canon: str,
+    target_bucket: str,
+    req_start: datetime,
+    req_end: datetime,
+) -> str | None:
+    if not user_sched_all:
+        return None
+    if req_end <= req_start:
+        req_end = req_end + timedelta(days=1)
+
+    buckets_today = (user_sched_all or {}).get(day_canon, {}) or {}
+    for src, seq in buckets_today.items():
+        for start_s, end_s in seq or []:
+            try:
+                start_dt = datetime.strptime(start_s, "%I:%M %p")
+                end_dt = datetime.strptime(end_s, "%I:%M %p")
+            except Exception:
+                continue
+            if end_dt <= start_dt:
+                end_dt = end_dt + timedelta(days=1)
+            if max(req_start, start_dt) < min(req_end, end_dt):
+                if str(src) == str(target_bucket):
+                    return (
+                        f"Duplicate entry: you are already scheduled in {src} during "
+                        f"{day_canon.title()} {fmt_time(start_dt)}-{fmt_time(end_dt)}."
+                    )
+                return (
+                    f"Schedule conflict: you are already scheduled in {src} during "
+                    f"{day_canon.title()} {fmt_time(start_dt)}-{fmt_time(end_dt)}. "
+                    "You can't also work another shift during that time."
+                )
+    return None
+
+
 def _minutes_from_hours(hours_value) -> int:
     try:
         return int(round(float(hours_value or 0.0) * 60.0))
@@ -2085,6 +2413,584 @@ def _handle_chat_request(
                 )
             except Exception:
                 pass
+        log_action(ss, oa_name_input, "callout", campus_title, day_canon, intent.start, intent.end, "no cover")
+        invalidate_hours_caches()
+        clear_availability_caches()
+        pickup_scan.clear_caches()
+        _bump_ui_epoch()
+        try:
+            _sync_direct_callout_record(
+                ss,
+                caller_name=canon_target,
+                campus_title=campus_title,
+                day_canon=day_canon,
+                start_dt=start_dt,
+                end_dt=end_dt,
+            )
+        except Exception as exc:
+            try:
+                append_audit(
+                    ss,
+                    actor=canon_target,
+                    action="db_callout_upsert_failed",
+                    campus=campus_title,
+                    day=day_canon,
+                    start=fmt_time(start_dt),
+                    end=fmt_time(end_dt),
+                    details=str(exc),
+                )
+            except Exception:
+                pass
+        return f"Done: {msg}"
+
+    if intent.kind == "add":
+        preflight = _preflight_work_request(
+            ss,
+            schedule,
+            requester=scheduler_user,
+            sheet_title=campus_title,
+            campus_key=campus_key,
+            day_canon=day_canon,
+            start_dt=start_dt,
+            end_dt=end_dt,
+            approvals_rows=approval_rows,
+        )
+        details = "requested"
+        if bool(preflight.get("overtime_needed")):
+            details += (
+                f" | overtime=yes"
+                f" | week_after={float(preflight['week_after_mins']) / 60.0:.2f}"
+                f" | day_after={float(preflight['day_after_mins']) / 60.0:.2f}"
+            )
+        rid = _submit_chat_approval_request(
+            ss,
+            schedule,
+            requester=scheduler_user,
+            action="add",
+            campus_key=campus_key,
+            sheet_title=campus_title,
+            day_canon=day_canon,
+            start_dt=start_dt,
+            end_dt=end_dt,
+            details=details,
+        )
+        st.session_state["APPROVALS_EPOCH"] = approvals_epoch + 1
+        if bool(preflight.get("overtime_needed")):
+            return f"Submitted add request for approval (id {rid}) as an overtime request."
+        return f"Submitted add request for approval (id {rid})."
+
+    if intent.kind == "remove":
+        rid = _submit_chat_approval_request(
+            ss,
+            schedule,
+            requester=scheduler_user,
+            action="remove",
+            campus_key=campus_key,
+            sheet_title=campus_title,
+            day_canon=day_canon,
+            start_dt=start_dt,
+            end_dt=end_dt,
+            details="requested",
+        )
+        st.session_state["APPROVALS_EPOCH"] = approvals_epoch + 1
+        return f"Submitted remove request for approval (id {rid})."
+
+    if intent.kind == "cover":
+        preflight = _preflight_work_request(
+            ss,
+            schedule,
+            requester=scheduler_user,
+            sheet_title=campus_title,
+            campus_key=campus_key,
+            day_canon=day_canon,
+            start_dt=start_dt,
+            end_dt=end_dt,
+            approvals_rows=approval_rows,
+        )
+        details = f"target={canon_target}"
+        if preflight.get("event_date"):
+            details += f" | date={preflight['event_date']}"
+        if bool(preflight.get("overtime_needed")):
+            details += (
+                f" | overtime=yes"
+                f" | week_after={float(preflight['week_after_mins']) / 60.0:.2f}"
+                f" | day_after={float(preflight['day_after_mins']) / 60.0:.2f}"
+            )
+        rid = _submit_chat_approval_request(
+            ss,
+            schedule,
+            requester=scheduler_user,
+            action="cover",
+            campus_key=campus_key,
+            sheet_title=campus_title,
+            day_canon=day_canon,
+            start_dt=start_dt,
+            end_dt=end_dt,
+            details=details,
+        )
+        st.session_state["APPROVALS_EPOCH"] = approvals_epoch + 1
+        if bool(preflight.get("overtime_needed")):
+            return f"Submitted cover request for approval (id {rid}) as an overtime request."
+        return f"Submitted cover request for approval (id {rid})."
+
+    if intent.kind == "change":
+        old_start_dt, old_end_dt = _anchor_range(intent.old_start, intent.old_end)
+        preflight = _preflight_change_request(
+            ss,
+            schedule,
+            requester=scheduler_user,
+            sheet_title=campus_title,
+            campus_key=campus_key,
+            old_day_canon=day_canon,
+            old_start_dt=old_start_dt,
+            old_end_dt=old_end_dt,
+            new_day_canon=day_canon,
+            new_start_dt=start_dt,
+            new_end_dt=end_dt,
+            approvals_rows=approval_rows,
+        )
+        details = (
+            "requested"
+            f" | old_day={day_canon.title()}"
+            f" | old_start={fmt_time(intent.old_start)}"
+            f" | old_end={fmt_time(intent.old_end)}"
+        )
+        if bool(preflight.get("overtime_needed")):
+            details += (
+                f" | overtime=yes"
+                f" | week_after={float(preflight['week_after_mins']) / 60.0:.2f}"
+                f" | day_after={float(preflight['day_after_mins']) / 60.0:.2f}"
+            )
+        rid = _submit_chat_approval_request(
+            ss,
+            schedule,
+            requester=scheduler_user,
+            action="change",
+            campus_key=campus_key,
+            sheet_title=campus_title,
+            day_canon=day_canon,
+            start_dt=start_dt,
+            end_dt=end_dt,
+            details=details,
+        )
+        st.session_state["APPROVALS_EPOCH"] = approvals_epoch + 1
+        if bool(preflight.get("overtime_needed")):
+            return f"Submitted change request for approval (id {rid}) as an overtime request."
+        return f"Submitted change request for approval (id {rid})."
+
+    if intent.kind == "swap":
+        raise ValueError("Swap requests are not supported in this chat flow yet.")
+
+    raise ValueError(
+        "Unknown command. Try: add Fri 2-4pm / callout Sunday 11am-3pm / cover Vraj Patel Tue 9-11 / remove Tue 11:30-1pm / change Wed from 3-4 to 4-5"
+    )
+
+
+def _manual_colored_callout_adjustment_minutes_for_week(
+    ss,
+    *,
+    requester: str,
+    week_bounds: tuple[date, date],
+    exclude_signatures: set[tuple[str, str, str, str]] | None = None,
+) -> tuple[int, dict[str, int]]:
+    exclude_signatures = exclude_signatures or set()
+    seen = set(exclude_signatures)
+    week_total = 0
+    per_day: dict[str, int] = {}
+    requester_key = name_key(requester)
+    ws, we = week_bounds
+
+    for title in list_tabs_for_sidebar(ss):
+        kind = campus_kind(title)
+        if kind not in {"UNH", "MC", "ONCALL"}:
+            continue
+        wr = _worksheet_week_bounds(ss, title) if kind == "ONCALL" else None
+        if wr and (wr[1] < ws or wr[0] > we):
+            continue
+        try:
+            if kind in {"UNH", "MC"}:
+                windows = pickup_scan.build_callout_windows_unh_mc(ss, title)
+            else:
+                windows = pickup_scan.build_callout_windows_oncall(ss, title)
+        except Exception:
+            continue
+        for window in windows:
+            if name_key(window.target_name) != requester_key:
+                continue
+            event_d = _event_date_for_window(ss, window)
+            if not event_d or not (ws <= event_d <= we):
+                continue
+            campus_key = "ONCALL" if window.kind == "ONCALL" else str(window.kind).upper()
+            signature = (event_d.isoformat(), campus_key, fmt_time(window.start), fmt_time(window.end))
+            if signature in seen:
+                continue
+            seen.add(signature)
+            mins = int((window.end - window.start).total_seconds() // 60)
+            if mins <= 0:
+                continue
+            day_canon = utils.normalize_day(event_d.strftime("%A"))
+            week_total += mins
+            per_day[day_canon] = int(per_day.get(day_canon, 0)) + mins
+            if callouts_db.supabase_callouts_enabled():
+                start_at = _combine_date_time_la(event_d, window.start.time())
+                end_at = _combine_date_time_la(event_d, window.end.time())
+                if end_at <= start_at:
+                    end_at = end_at + timedelta(days=1)
+                record_key = "|".join(
+                    [
+                        "manual-colored-callout",
+                        requester_key,
+                        campus_key,
+                        event_d.isoformat(),
+                        fmt_time(window.start),
+                        fmt_time(window.end),
+                    ]
+                )
+                try:
+                    callouts_db.upsert_callout(
+                        {
+                            "approval_id": "manual-" + hashlib.sha1(record_key.encode("utf-8")).hexdigest()[:24],
+                            "submitted_at": datetime.now(LA_TZ).isoformat(timespec="seconds"),
+                            "campus": campus_key,
+                            "caller_name": window.target_name,
+                            "reason": "manual colored cell",
+                            "event_date": str(event_d),
+                            "shift_start_at": start_at.isoformat(timespec="seconds"),
+                            "shift_end_at": end_at.isoformat(timespec="seconds"),
+                            "duration_hours": round(_duration_hours_between(start_at, end_at), 4),
+                        }
+                    )
+                except Exception:
+                    pass
+
+    return week_total, per_day
+
+
+def _resolve_request_sheet(ss, requested_campus_or_tab: str | None, active_tab: str | None) -> tuple[str, str]:
+    sheet_title, campus_key = chat_add_mod._resolve_campus_title(ss, requested_campus_or_tab, active_tab)
+    return sheet_title, ("ONCALL" if campus_key == "ONCALL" else str(campus_key).upper())
+
+
+def _load_request_schedule_state(
+    ss,
+    schedule,
+    *,
+    requester: str,
+    sheet_title: str,
+    campus_key: str,
+    approvals_rows: list[dict],
+) -> tuple[dict, dict, tuple[date, date]]:
+    week_titles_map = {}
+    unh_title, mc_title, oncall_title, _ = _request_schedule_titles(ss, sheet_title, campus_key)
+    week_titles_map["UNH"] = unh_title
+    week_titles_map["MC"] = mc_title
+    week_titles_map["ONCALL"] = oncall_title
+    request_week_bounds = _request_week_bounds(ss, week_titles_map, sheet_title)
+    base_sched = get_user_schedule_for_titles(
+        ss,
+        schedule,
+        requester,
+        unh_title=unh_title,
+        mc_title=mc_title,
+        oncall_title=oncall_title,
+    )
+    week_titles = {title for title in week_titles_map.values() if title}
+    user_sched_all = _append_my_pickups_into_sched(
+        base_sched,
+        approvals_rows,
+        requester=requester,
+        week_titles=week_titles,
+        include_statuses={"PENDING", "APPROVED"},
+        ss=ss,
+        week_bounds=request_week_bounds,
+    )
+    return base_sched, user_sched_all, request_week_bounds
+
+
+def _preflight_work_request(
+    ss,
+    schedule,
+    *,
+    requester: str,
+    sheet_title: str,
+    campus_key: str,
+    day_canon: str,
+    start_dt: datetime,
+    end_dt: datetime,
+    approvals_rows: list[dict],
+) -> dict[str, object]:
+    base_sched, user_sched_all, week_bounds = _load_request_schedule_state(
+        ss,
+        schedule,
+        requester=requester,
+        sheet_title=sheet_title,
+        campus_key=campus_key,
+        approvals_rows=approvals_rows,
+    )
+
+    target_bucket = "On-Call" if campus_key == "ONCALL" else campus_key
+    conflict = _find_any_conflict(user_sched_all, day_canon, target_bucket, start_dt, end_dt)
+    if conflict:
+        raise ValueError(conflict)
+
+    existing_intervals = _day_intervals(user_sched_all, day_canon)
+    req_mins = int(labor_rules.minutes_between(start_dt, end_dt))
+    break_res = labor_rules.break_check_with_suggestions(
+        existing_intervals,
+        (start_dt, end_dt),
+        window=(start_dt, end_dt),
+        min_duration_mins=max(30, req_mins),
+        step_mins=30,
+    )
+    if not break_res.ok:
+        raise ValueError("You can't work more than 5 hours continuously without a 30-minute break.")
+
+    week_before_mins, per_day_before = _overtime_baseline_minutes(
+        requester=requester,
+        base_sched=base_sched,
+        week_bounds=week_bounds,
+        ss=ss,
+        approvals_rows=approvals_rows,
+    )
+    day_after_mins = int(per_day_before.get(day_canon, 0)) + req_mins
+    week_after_mins = int(week_before_mins) + req_mins
+    overtime_reasons: list[str] = []
+    if week_after_mins > labor_rules.MAX_WEEKLY_MINS:
+        overtime_reasons.append(
+            f"weekly total would be {week_after_mins / 60.0:.2f} hrs (cap {labor_rules.MAX_WEEKLY_MINS / 60.0:.0f})"
+        )
+    if day_after_mins > labor_rules.MAX_DAILY_MINS:
+        overtime_reasons.append(
+            f"day total would be {day_after_mins / 60.0:.2f} hrs (cap {labor_rules.MAX_DAILY_MINS / 60.0:.0f})"
+        )
+
+    event_d = _date_for_weekday_in_sheet(ss, sheet_title, day_canon)
+    if not event_d:
+        event_d = week_range_mod.date_for_weekday(week_bounds[0], week_bounds[1], day_canon)
+
+    return {
+        "week_bounds": week_bounds,
+        "event_date": event_d,
+        "week_after_mins": week_after_mins,
+        "day_after_mins": day_after_mins,
+        "overtime_needed": bool(overtime_reasons),
+        "overtime_reasons": overtime_reasons,
+    }
+
+
+def _preflight_change_request(
+    ss,
+    schedule,
+    *,
+    requester: str,
+    sheet_title: str,
+    campus_key: str,
+    old_day_canon: str,
+    old_start_dt: datetime,
+    old_end_dt: datetime,
+    new_day_canon: str,
+    new_start_dt: datetime,
+    new_end_dt: datetime,
+    approvals_rows: list[dict],
+) -> dict[str, object]:
+    base_sched, user_sched_all, week_bounds = _load_request_schedule_state(
+        ss,
+        schedule,
+        requester=requester,
+        sheet_title=sheet_title,
+        campus_key=campus_key,
+        approvals_rows=approvals_rows,
+    )
+
+    target_bucket = "On-Call" if campus_key == "ONCALL" else campus_key
+    base_sched_minus_old = _subtract_sched_window(
+        base_sched,
+        day_canon=old_day_canon,
+        bucket=target_bucket,
+        start_dt=old_start_dt,
+        end_dt=old_end_dt,
+    )
+    user_sched_minus_old = _subtract_sched_window(
+        user_sched_all,
+        day_canon=old_day_canon,
+        bucket=target_bucket,
+        start_dt=old_start_dt,
+        end_dt=old_end_dt,
+    )
+
+    conflict = _find_any_conflict(user_sched_minus_old, new_day_canon, target_bucket, new_start_dt, new_end_dt)
+    if conflict:
+        raise ValueError(conflict)
+
+    existing_intervals = _day_intervals(user_sched_minus_old, new_day_canon)
+    req_mins = int(labor_rules.minutes_between(new_start_dt, new_end_dt))
+    break_res = labor_rules.break_check_with_suggestions(
+        existing_intervals,
+        (new_start_dt, new_end_dt),
+        window=(new_start_dt, new_end_dt),
+        min_duration_mins=max(30, req_mins),
+        step_mins=30,
+    )
+    if not break_res.ok:
+        raise ValueError("You can't work more than 5 hours continuously without a 30-minute break.")
+
+    week_before_mins, per_day_before = _overtime_baseline_minutes(
+        requester=requester,
+        base_sched=base_sched_minus_old,
+        week_bounds=week_bounds,
+        ss=ss,
+        approvals_rows=approvals_rows,
+    )
+    day_after_mins = int(per_day_before.get(new_day_canon, 0)) + req_mins
+    week_after_mins = int(week_before_mins) + req_mins
+    overtime_reasons: list[str] = []
+    if week_after_mins > labor_rules.MAX_WEEKLY_MINS:
+        overtime_reasons.append(
+            f"weekly total would be {week_after_mins / 60.0:.2f} hrs (cap {labor_rules.MAX_WEEKLY_MINS / 60.0:.0f})"
+        )
+    if day_after_mins > labor_rules.MAX_DAILY_MINS:
+        overtime_reasons.append(
+            f"day total would be {day_after_mins / 60.0:.2f} hrs (cap {labor_rules.MAX_DAILY_MINS / 60.0:.0f})"
+        )
+
+    event_d = _date_for_weekday_in_sheet(ss, sheet_title, new_day_canon)
+    if not event_d:
+        event_d = week_range_mod.date_for_weekday(week_bounds[0], week_bounds[1], new_day_canon)
+
+    return {
+        "week_bounds": week_bounds,
+        "event_date": event_d,
+        "week_after_mins": week_after_mins,
+        "day_after_mins": day_after_mins,
+        "overtime_needed": bool(overtime_reasons),
+        "overtime_reasons": overtime_reasons,
+    }
+
+
+def _submit_chat_approval_request(
+    ss,
+    schedule,
+    *,
+    requester: str,
+    action: str,
+    campus_key: str,
+    sheet_title: str,
+    day_canon: str,
+    start_dt: datetime,
+    end_dt: datetime,
+    details: str,
+) -> str:
+    details_with_meta = _attach_details_meta(
+        details=details,
+        campus_key=campus_key,
+        sheet_title=sheet_title,
+        sheet_gid=_sheet_gid_for_title(schedule, sheet_title),
+    )
+    return submit_approval_request(
+        ss,
+        requester=requester,
+        action=action,
+        campus=campus_key,
+        day=day_canon.title(),
+        start=fmt_time(start_dt),
+        end=fmt_time(end_dt),
+        details=details_with_meta,
+    )
+
+
+def _sync_direct_callout_record(
+    ss,
+    *,
+    caller_name: str,
+    campus_title: str,
+    day_canon: str,
+    start_dt: datetime,
+    end_dt: datetime,
+) -> None:
+    if not callouts_db.supabase_callouts_enabled():
+        return
+    event_d = _date_for_weekday_in_sheet(ss, campus_title, day_canon)
+    if not event_d:
+        wr = _worksheet_week_bounds(ss, campus_title) or _week_bounds_la()
+        event_d = week_range_mod.date_for_weekday(wr[0], wr[1], day_canon)
+    if not event_d:
+        return
+
+    start_at = _combine_date_time_la(event_d, start_dt.time())
+    end_at = _combine_date_time_la(event_d, end_dt.time())
+    if end_at <= start_at:
+        end_at = end_at + timedelta(days=1)
+
+    campus_key = "ONCALL" if campus_kind(campus_title) == "ONCALL" else campus_kind(campus_title)
+    record_key = "|".join(
+        [
+            "direct-callout",
+            name_key(caller_name),
+            campus_title,
+            str(event_d),
+            fmt_time(start_dt),
+            fmt_time(end_dt),
+        ]
+    )
+    callouts_db.upsert_callout(
+        {
+            "approval_id": "direct-" + hashlib.sha1(record_key.encode("utf-8")).hexdigest()[:24],
+            "submitted_at": datetime.now(LA_TZ).isoformat(timespec="seconds"),
+            "campus": campus_key,
+            "caller_name": caller_name,
+            "reason": None,
+            "event_date": str(event_d),
+            "shift_start_at": start_at.isoformat(timespec="seconds"),
+            "shift_end_at": end_at.isoformat(timespec="seconds"),
+            "duration_hours": round(_duration_hours_between(start_at, end_at), 4),
+        }
+    )
+
+
+def _handle_chat_request(
+    ss,
+    schedule,
+    *,
+    prompt: str,
+    oa_name_input: str,
+    scheduler_user: str,
+    active_tab: str,
+    roster_canon_by_key: dict[str, str],
+) -> str:
+    if re.search(r"\b(schedule|my\s+schedule|what\s+are\s+my\s+shifts?)\b", prompt, flags=re.I):
+        return chat_schedule_response(ss, schedule, scheduler_user)
+
+    intent = parse_intent(prompt, default_campus=active_tab, default_name=oa_name_input)
+    canon_target = get_canonical_roster_name(intent.name or oa_name_input, roster_canon_by_key)
+    requested_campus = getattr(intent, "campus", "") or active_tab
+    campus_title, campus_key = _resolve_request_sheet(ss, requested_campus, active_tab)
+    day_canon = intent.day
+
+    if intent.kind == "callout" and not day_canon:
+        user_sched = get_user_schedule(ss, schedule, canon_target)
+        inferred_day = _infer_callout_day_from_schedule(user_sched, campus_title, intent.start, intent.end)
+        if not inferred_day:
+            raise ValueError(
+                "Please include the day for this callout, or use a time window that matches exactly one scheduled shift."
+            )
+        day_canon = inferred_day
+
+    start_dt, end_dt = _anchor_range(intent.start, intent.end)
+    approvals_epoch = int(st.session_state.get("APPROVALS_EPOCH", 0))
+    approval_rows = cached_approval_table(ss.id, approvals_epoch, max_rows=1000) or []
+
+    if intent.kind == "callout":
+        msg = do_callout(
+            st,
+            ss,
+            schedule,
+            canon_target_name=canon_target,
+            campus_title=campus_title,
+            day=day_canon,
+            start=intent.start,
+            end=intent.end,
+            covered_by=None,
+        )
         log_action(ss, oa_name_input, "callout", campus_title, day_canon, intent.start, intent.end, "no cover")
         invalidate_hours_caches()
         clear_availability_caches()
