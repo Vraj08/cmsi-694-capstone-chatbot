@@ -72,6 +72,109 @@ class PickupWindow:
     end: datetime
 
 
+@dataclass(frozen=True)
+class AdjustmentNote:
+    campus_title: str
+    kind: str
+    action: str
+    actor_name: str
+    target_name: str
+    date_label: str
+    start: datetime
+    end: datetime
+    raw_text: str
+
+
+def _clean_note_person(value: str) -> str:
+    s = re.sub(r"\s+", " ", str(value or "").strip(), flags=re.UNICODE).strip()
+    if not s:
+        return ""
+    s = re.sub(r"^\s*(oa|goa)\s*[:\-]?\s*", "", s, flags=re.I)
+    return s.strip()
+
+
+def _kind_from_note(title: str, campus_label: str) -> str:
+    label = str(campus_label or "").lower()
+    if "on call" in label or "on-call" in label:
+        return "ONCALL"
+    if re.search(r"\bmc\b|main", label):
+        return "MC"
+    if re.search(r"\bunh\b", label):
+        return "UNH"
+    merged = str(title or "").lower()
+    if "on call" in merged or "on-call" in merged:
+        return "ONCALL"
+    if re.search(r"\bmc\b|main", merged):
+        return "MC"
+    return "UNH"
+
+
+def _parse_adjustment_note_lines(title: str, cell_txt: str) -> List[AdjustmentNote]:
+    raw = str(cell_txt or "").strip()
+    if not raw or "|" not in raw:
+        return []
+
+    out: List[AdjustmentNote] = []
+    for line in re.split(r"[\r\n]+", raw):
+        txt = line.strip()
+        if not txt or "|" not in txt:
+            continue
+
+        parts = [part.strip() for part in txt.split("|")]
+        if len(parts) < 4:
+            continue
+
+        head = parts[0]
+        date_label = parts[1]
+        range_txt = parts[2]
+        campus_label = parts[3]
+
+        action = ""
+        actor_name = ""
+        target_name = ""
+        if re.search(r"\bcovering\b", head, flags=re.I):
+            names = re.split(r"\bcovering\b", head, maxsplit=1, flags=re.I)
+            if len(names) != 2:
+                continue
+            action = "pickup"
+            actor_name = _clean_note_person(names[0])
+            target_name = _clean_note_person(names[1])
+        elif re.search(r"\bcalled\s+out\b", head, flags=re.I):
+            action = "callout"
+            actor_name = _clean_note_person(re.sub(r"\bcalled\s+out\b.*$", "", head, flags=re.I))
+        else:
+            continue
+
+        if not actor_name or not _MMDD_RE.search(date_label):
+            continue
+
+        match = _RANGE_RE.match(range_txt)
+        if not match:
+            continue
+        start_dt = _parse_time_cell(match.group(1))
+        end_dt = _parse_time_cell(match.group(2))
+        if not start_dt or not end_dt:
+            continue
+        if end_dt <= start_dt:
+            end_dt = end_dt + timedelta(days=1)
+
+        out.append(
+            AdjustmentNote(
+                campus_title=title,
+                kind=_kind_from_note(title, campus_label),
+                action=action,
+                actor_name=actor_name,
+                target_name=target_name,
+                date_label=date_label,
+                start=start_dt,
+                end=end_dt,
+                raw_text=txt,
+            )
+        )
+
+    return out
+
+
 def _rgb(cell: Dict[str, Any]) -> Optional[Dict[str, float]]:
     if not isinstance(cell, dict):
         return None
@@ -115,6 +218,10 @@ def _is_orange(bg: Optional[Dict[str, float]]) -> bool:
     green = float(bg.get("green", 0.0) or 0.0)
     blue = float(bg.get("blue", 0.0) or 0.0)
     return red >= 0.90 and green >= 0.50 and blue <= 0.20
+
+
+def _is_callout_color(bg: Optional[Dict[str, float]]) -> bool:
+    return _is_red(bg) or _is_orange(bg)
 
 
 def _cell_text(cell: Dict[str, Any]) -> str:
@@ -342,6 +449,54 @@ def build_tradeboard_unh_mc(ss, title: str, *, max_rows: int = 900, max_cols: in
     return df, windows
 
 
+def build_callout_windows_unh_mc(ss, title: str, *, max_rows: int = 900, max_cols: int = 12) -> List[PickupWindow]:
+    grid, bg = _fetch_griddata(ss, title, max_rows=max_rows, max_cols=max_cols)
+    if not grid:
+        return []
+
+    day_cols = _day_cols_from_grid(grid)
+    if not day_cols:
+        return []
+
+    days_order = [
+        day
+        for day in ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+        if day in day_cols
+    ]
+    if not days_order:
+        days_order = sorted(day_cols.keys())
+
+    time_rows = _time_rows_unh_mc(grid)
+    if not time_rows:
+        return []
+
+    kind = "MC" if re.search(r"\bmc\b|main", (title or "").lower()) else "UNH"
+    halfhour_slots: List[Tuple[datetime, datetime, str, str, str, str]] = []
+
+    time_rows.append(len(grid))
+    for i in range(len(time_rows) - 1):
+        r0, r1 = time_rows[i], time_rows[i + 1]
+        t_txt = (grid[r0][0] if grid[r0] else "") or ""
+        start_dt = _parse_time_cell(str(t_txt))
+        if not start_dt:
+            continue
+        end_dt = start_dt + timedelta(minutes=30)
+
+        lane_rows = list(range(r0 + 1, r1))
+        for day in days_order:
+            col = day_cols[day]
+            for rr in lane_rows:
+                if rr >= len(grid):
+                    continue
+                raw = grid[rr][col] if col < len(grid[rr]) else ""
+                txt = _clean_name(raw)
+                bgc = bg[rr][col] if rr < len(bg) and col < len(bg[rr]) else None
+                if txt and _is_callout_color(bgc):
+                    halfhour_slots.append((start_dt, end_dt, title, kind, day, txt))
+
+    return _group_halfhour_slots(halfhour_slots)
+
+
 def build_tradeboard_oncall(ss, title: str, *, max_rows: int = 900, max_cols: int = 16) -> Tuple[pd.DataFrame, List[PickupWindow]]:
     grid, bg = _fetch_griddata(ss, title, max_rows=max_rows, max_cols=max_cols)
     if not grid:
@@ -505,6 +660,164 @@ def build_tradeboard_oncall(ss, title: str, *, max_rows: int = 900, max_cols: in
     return df, windows
 
 
+def build_callout_windows_oncall(ss, title: str, *, max_rows: int = 900, max_cols: int = 16) -> List[PickupWindow]:
+    grid, bg = _fetch_griddata(ss, title, max_rows=max_rows, max_cols=max_cols)
+    if not grid:
+        return []
+
+    def _score_header_row(r: int) -> int:
+        row = grid[r] if r < len(grid) else []
+        score = 0
+        for c in range(1, min(max_cols, len(row))):
+            value = (row[c] or "").strip()
+            if not value:
+                continue
+            low = value.lower()
+            if "time - off" in low or "shift swaps" in low or "future swaps" in low:
+                break
+            if _canon_day_from_header(value):
+                score += 1
+                continue
+            if _MMDD_RE.search(value):
+                score += 1
+        return score
+
+    header_row = None
+    best = 0
+    for r in range(min(18, len(grid))):
+        score = _score_header_row(r)
+        if score > best:
+            best = score
+            header_row = r
+    if header_row is None or best < 4:
+        header_row = 0
+
+    hdr = grid[header_row]
+
+    date_cols: List[int] = []
+    for c in range(1, max_cols):
+        if c >= len(hdr):
+            break
+        value = (hdr[c] or "").strip()
+        if not value:
+            continue
+        low = value.lower()
+        if "time - off" in low or "shift swaps" in low or "future swaps" in low:
+            break
+        if _canon_day_from_header(value) or _MMDD_RE.search(value):
+            date_cols.append(c)
+    if not date_cols:
+        return []
+
+    day_cols: Dict[str, int] = {}
+    for idx, col in enumerate(date_cols):
+        value = (hdr[col] or "").strip()
+        day = _canon_day_from_header(value)
+        if not day:
+            day = _WEEK_ORDER_7[idx] if idx < len(_WEEK_ORDER_7) else f"day{idx}"
+        if day not in day_cols:
+            day_cols[day] = col
+
+    days_order = [day for day in _WEEK_ORDER_7 if day in day_cols] or list(day_cols.keys())
+    scan_cols = [day_cols[day] for day in days_order]
+    label_rows: List[int] = []
+    for r in range(header_row + 1, len(grid)):
+        col0 = (grid[r][0] if len(grid[r]) > 0 else "") or ""
+        if _RANGE_RE.match(str(col0)):
+            label_rows.append(r)
+            continue
+        for col in scan_cols:
+            value = (grid[r][col] if col < len(grid[r]) else "") or ""
+            if _RANGE_RE.match(str(value)):
+                label_rows.append(r)
+                break
+    if not label_rows:
+        return []
+
+    label_rows.append(len(grid))
+    seen: set[tuple[str, str, str, str, datetime, datetime]] = set()
+    windows: List[PickupWindow] = []
+
+    for i in range(len(label_rows) - 1):
+        label_row = label_rows[i]
+        next_row = label_rows[i + 1]
+
+        shared_range = ""
+        col0 = (grid[label_row][0] if len(grid[label_row]) > 0 else "") or ""
+        if _RANGE_RE.match(str(col0)):
+            shared_range = str(col0)
+
+        lane_rows = list(range(label_row, next_row))
+
+        for day in days_order:
+            col = day_cols[day]
+            cell = (grid[label_row][col] if col < len(grid[label_row]) else "") or ""
+            range_txt = str(cell) if _RANGE_RE.match(str(cell)) else shared_range
+            match = _RANGE_RE.match(range_txt.strip()) if range_txt else None
+            if not match:
+                continue
+
+            start_dt = _parse_time_cell(match.group(1))
+            end_dt = _parse_time_cell(match.group(2))
+            if not start_dt or not end_dt:
+                continue
+            if end_dt <= start_dt:
+                end_dt = end_dt + timedelta(days=1)
+
+            try:
+                dur_mins = int((end_dt - start_dt).total_seconds() // 60)
+            except Exception:
+                dur_mins = 0
+            if start_dt.hour >= 18 and 0 < dur_mins <= 90:
+                end_dt = start_dt + timedelta(hours=5)
+
+            for rr in lane_rows:
+                if rr >= len(grid) or col >= len(grid[rr]):
+                    continue
+                raw = grid[rr][col]
+                if _RANGE_RE.match(str(raw or "")):
+                    continue
+                txt = _clean_name(raw)
+                bgc = bg[rr][col] if rr < len(bg) and col < len(bg[rr]) else None
+                if txt and _is_callout_color(bgc):
+                    key = (title, "ONCALL", day, txt, start_dt, end_dt)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    windows.append(PickupWindow(title, "ONCALL", day, txt, start_dt, end_dt))
+
+    return windows
+
+
+def build_adjustment_notes(ss, title: str, *, max_rows: int = 900, max_cols: int = 24) -> List[AdjustmentNote]:
+    grid, _bg = _fetch_griddata(ss, title, max_rows=max_rows, max_cols=max_cols)
+    if not grid:
+        return []
+
+    out: List[AdjustmentNote] = []
+    seen: set[tuple[str, str, str, str, str, datetime, datetime]] = set()
+    for row in grid:
+        for cell in row:
+            txt = str(cell or "").strip()
+            if "|" not in txt or ("covering" not in txt.lower() and "called out" not in txt.lower()):
+                continue
+            for note in _parse_adjustment_note_lines(title, txt):
+                key = (
+                    note.action,
+                    note.actor_name.lower(),
+                    note.target_name.lower(),
+                    note.date_label,
+                    note.kind,
+                    note.start,
+                    note.end,
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(note)
+    return out
+
+
 @st.cache_data(ttl=15, show_spinner=False)
 def cached_tradeboard(
     ss_id: str,
@@ -539,8 +852,82 @@ def cached_tradeboard(
     }
 
 
+@st.cache_data(ttl=15, show_spinner=False)
+def cached_callout_windows(
+    ss_id: str,
+    tab_title: str,
+    version: int,
+    kind: str,
+    *,
+    max_rows: int = 900,
+    max_cols: int = 16,
+) -> Dict[str, Any]:
+    del version
+    ss = st.session_state.get("_SS_HANDLE_BY_ID", {}).get(ss_id)
+    if not ss:
+        return {"windows": []}
+    if kind in {"UNH", "MC"}:
+        wins = build_callout_windows_unh_mc(ss, tab_title, max_rows=max_rows, max_cols=min(max_cols, 12))
+    else:
+        wins = build_callout_windows_oncall(ss, tab_title, max_rows=max_rows, max_cols=max_cols)
+    return {
+        "windows": [
+            {
+                "campus_title": w.campus_title,
+                "kind": w.kind,
+                "day_canon": w.day_canon,
+                "target_name": w.target_name,
+                "start": w.start.isoformat(),
+                "end": w.end.isoformat(),
+            }
+            for w in wins
+        ]
+    }
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def cached_adjustment_notes(
+    ss_id: str,
+    tab_title: str,
+    version: int,
+    kind: str,
+    *,
+    max_rows: int = 900,
+    max_cols: int = 24,
+) -> Dict[str, Any]:
+    del version, kind
+    ss = st.session_state.get("_SS_HANDLE_BY_ID", {}).get(ss_id)
+    if not ss:
+        return {"notes": []}
+    notes = build_adjustment_notes(ss, tab_title, max_rows=max_rows, max_cols=max_cols)
+    return {
+        "notes": [
+            {
+                "campus_title": note.campus_title,
+                "kind": note.kind,
+                "action": note.action,
+                "actor_name": note.actor_name,
+                "target_name": note.target_name,
+                "date_label": note.date_label,
+                "start": note.start.isoformat(),
+                "end": note.end.isoformat(),
+                "raw_text": note.raw_text,
+            }
+            for note in notes
+        ]
+    }
+
+
 def clear_caches() -> None:
     try:
         cached_tradeboard.clear()  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    try:
+        cached_callout_windows.clear()  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    try:
+        cached_adjustment_notes.clear()  # type: ignore[attr-defined]
     except Exception:
         pass
