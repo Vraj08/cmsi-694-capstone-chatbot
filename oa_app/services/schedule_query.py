@@ -15,6 +15,7 @@ from ..config import (
     LOCKS_SHEET,
     ONCALL_MAX_COLS,
     ONCALL_MAX_ROWS,
+    ROSTER_SHEET,
 )
 # Optional override; if missing, treat as None
 try:
@@ -23,6 +24,7 @@ except Exception:
     _ONCALL_OVERRIDE = None
 
 from ..core.quotas import _safe_batch_get
+from ..core import week_range as week_range_mod
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 2) Normalize the OA name (case-insensitive substring matching)
@@ -772,3 +774,50 @@ def render_schedule_dataframe(st, df: pd.DataFrame):
 
     st.markdown("### Full Schedule Table")
     st.dataframe(show, use_container_width=True)
+
+
+def get_user_schedule_for_titles(
+    ss: gspread.Spreadsheet,
+    _schedule_unused,
+    oa_name: str,
+    *,
+    unh_title: str | None = None,
+    mc_title: str | None = None,
+    oncall_title: str | None = None,
+) -> Dict[str, Dict[str, List[Tuple[str, str]]]]:
+    """Return a user's schedule, but for explicit worksheet titles."""
+
+    result: Dict[str, Dict[str, List[Tuple[str, str]]]] = {
+        d: {"UNH": [], "MC": [], "On-Call": []} for d in _WEEK_ORDER_7
+    }
+
+    name_norm = _norm_name(oa_name)
+
+    if unh_title:
+        try:
+            ws_unh = ss.worksheet(unh_title)
+            unh_ranges = _unh_mc_ranges(ws_unh, name_norm)
+            for d, blocks in unh_ranges.items():
+                result[d]["UNH"] = blocks
+        except Exception:
+            pass
+
+    if mc_title:
+        try:
+            ws_mc = ss.worksheet(mc_title)
+            mc_ranges = _unh_mc_ranges(ws_mc, name_norm)
+            for d, blocks in mc_ranges.items():
+                result[d]["MC"] = blocks
+        except Exception:
+            pass
+
+    if oncall_title:
+        try:
+            ws_on = ss.worksheet(oncall_title)
+            oc = _oncall_blocks(ws_on, name_norm)
+            for d, blocks in oc.items():
+                result[d]["On-Call"].extend(blocks)
+        except Exception:
+            pass
+
+    return result

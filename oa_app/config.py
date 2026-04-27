@@ -11,6 +11,7 @@ ROSTER_NAME_HEADER_ALIASES = [
     "Name",
 ]
 AUDIT_SHEET = "Audit Log"
+APPROVAL_SHEET = "Pending Actions"
 LOCKS_SHEET = "_Locks"   # tiny sheet for FCFS locking
 ONCALL_SHEET_OVERRIDE = ""  # e.g., "On-Call (Fall Wk 2)"
 # ===== guardrails =====
