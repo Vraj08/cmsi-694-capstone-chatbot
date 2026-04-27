@@ -1,34 +1,29 @@
-
 from __future__ import annotations
+
 import os
 import re
+from datetime import datetime, timedelta
 from typing import Iterable, List, Optional, Tuple, Dict
 
-import streamlit as st
 import gspread
 import gspread.utils as a1
+import streamlit as st
 
 from ..config import (
-    OA_SCHEDULE_SHEETS,   # ["UNH ...", "MC ..."]
+    OA_SCHEDULE_SHEETS,
     AUDIT_SHEET,
     LOCKS_SHEET,
     ONCALL_MAX_COLS,
     ONCALL_MAX_ROWS,
-    DAY_CACHE_TTL_SEC,
-    SIDEBAR_DENY_TABS,
-    ONCALL_SHEET_OVERRIDE,  # optional override of On-Call tab name
+    ONCALL_SHEET_OVERRIDE,
+    ROSTER_SHEET,
 )
-from ..core.quotas import _safe_batch_get, read_day_column_map_cached
+from ..core.quotas import _safe_batch_get
+from ..core import week_range as week_range_mod
+from . import schedule_query
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Debug controls (no-UI): secrets/env/session_state
-# ──────────────────────────────────────────────────────────────────────────────
 
 def _hours_debug_enabled() -> bool:
-    """Return True if the caller explicitly enabled slow/verbose counting mode.
-    This only affects *how* we count UNH/MC (fast vs grid), not the resulting totals.
-    """
     try:
         if bool(st.session_state.get("HOURS_DEBUG")):
             return True
@@ -42,61 +37,62 @@ def _hours_debug_enabled() -> bool:
         return False
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Resolve the three tabs we total over: UNH, MC, and On-Call (neighbor to MC)
-# ──────────────────────────────────────────────────────────────────────────────
-
 _DENY_LOW = {
     AUDIT_SHEET.strip().lower(),
     LOCKS_SHEET.strip().lower(),
-    *(t.strip().lower() for t in (SIDEBAR_DENY_TABS or [])),
+    ROSTER_SHEET.strip().lower(),
 }
 
-def _resolve_title(actuals: List[gspread.Worksheet], wanted: str) -> str | None:
-    wanted_low = (wanted or "").strip().lower()
-    by_low = {w.title.strip().lower(): w.title for w in actuals}
-    if wanted_low in by_low:
-        return by_low[wanted_low]
-    first = wanted_low.split()[0] if wanted_low else ""
-    for w in actuals:
-        t = w.title.strip(); tl = t.lower()
-        if tl == wanted_low or (first and tl.startswith(first)):
-            return t
-    return None
 
-def _three_titles_unh_mc_oncall(ss: gspread.Spreadsheet) -> list[str]:
+@st.cache_data(ttl=120, show_spinner=False)
+def _cached_visible_titles(ss_id: str) -> list[str]:
+    ss = st.session_state.get("_SS_HANDLE_BY_ID", {}).get(ss_id)
+    if not ss:
+        return []
     try:
-        ws_all = ss.worksheets()            # includes hidden
+        ws_all = ss.worksheets()
     except Exception:
         return []
-
-    # Build a visible-only list in the same UI order
-    def _is_hidden(w):
+    titles: list[str] = []
+    for ws in ws_all:
         try:
-            return bool(getattr(w, "_properties", {}).get("hidden", False))
+            hidden = bool(getattr(ws, "_properties", {}).get("hidden", False))
         except Exception:
-            return False
+            hidden = False
+        if hidden:
+            continue
+        title = str(getattr(ws, "title", "") or "").strip()
+        if not title or title.lower() in _DENY_LOW:
+            continue
+        titles.append(title)
+    return titles
 
-    ws_visible = [w for w in ws_all if not _is_hidden(w)]
+
+def _three_titles_unh_mc_oncall(ss: gspread.Spreadsheet) -> list[str]:
+    ss_id = getattr(ss, "id", "")
+    titles = _cached_visible_titles(ss_id)
+    if not titles:
+        try:
+            titles = [ws.title for ws in ss.worksheets() if not bool(getattr(ws, "_properties", {}).get("hidden", False))]
+        except Exception:
+            return []
 
     unh_cfg, mc_cfg = OA_SCHEDULE_SHEETS[0], OA_SCHEDULE_SHEETS[1]
 
-    # Resolve UNH/MC against visible list first (so titles match what the user sees)
-    def _resolve_title_visible(wanted: str) -> str | None:
-        wanted_low = (wanted or "").strip().lower()
-        by_low = {w.title.strip().lower(): w.title for w in ws_visible}
-        if wanted_low in by_low:
-            return by_low[wanted_low]
-        first = wanted_low.split()[0] if wanted_low else ""
-        for w in ws_visible:
-            t = w.title.strip(); tl = t.lower()
-            if tl == wanted_low or (first and tl.startswith(first)):
+    def _resolve_from_titles(wanted: str) -> str | None:
+        want = (wanted or "").strip().lower()
+        by_low = {t.strip().lower(): t for t in titles}
+        if want in by_low:
+            return by_low[want]
+        first = want.split()[0] if want else ""
+        for t in titles:
+            tl = t.lower()
+            if tl == want or (first and tl.startswith(first)):
                 return t
-        # fallback to any sheet (rare)
-        return _resolve_title(ws_all, wanted)
+        return None
 
-    unh_title = _resolve_title_visible(unh_cfg)
-    mc_title  = _resolve_title_visible(mc_cfg)
+    unh_title = _resolve_from_titles(unh_cfg)
+    mc_title = _resolve_from_titles(mc_cfg)
 
     out: list[str] = []
     if unh_title:
@@ -104,48 +100,75 @@ def _three_titles_unh_mc_oncall(ss: gspread.Spreadsheet) -> list[str]:
     if mc_title:
         out.append(mc_title)
 
-    # Prefer explicit override; else pick the **visible** neighbor to MC’s right.
     oncall_title = None
-    if mc_title:
-        if ONCALL_SHEET_OVERRIDE and ONCALL_SHEET_OVERRIDE.strip():
-            cand = _resolve_title_visible(ONCALL_SHEET_OVERRIDE)
-            if cand:
+    if ONCALL_SHEET_OVERRIDE and ONCALL_SHEET_OVERRIDE.strip():
+        oncall_title = _resolve_from_titles(ONCALL_SHEET_OVERRIDE)
+
+    def _looks_oncall(title: str) -> bool:
+        tl = (title or "").lower()
+        return ("on call" in tl) or ("oncall" in tl)
+
+    if not oncall_title:
+        try:
+            today = week_range_mod.la_today()
+            sunday_offset = (today.weekday() + 1) % 7
+            ws = today - timedelta(days=sunday_offset)
+            we = ws + timedelta(days=6)
+            for cand in titles:
+                tl = cand.strip().lower()
+                if tl in _DENY_LOW or "general" in tl:
+                    continue
+                if not _looks_oncall(cand):
+                    continue
+                wr = week_range_mod.week_range_from_title(cand, today=today)
+                if wr and wr == (ws, we):
+                    oncall_title = cand
+                    break
+        except Exception:
+            pass
+
+    if not oncall_title and mc_title:
+        try:
+            idx = titles.index(mc_title)
+        except ValueError:
+            idx = -1
+        if idx >= 0:
+            for cand in titles[idx + 1:]:
+                tl = cand.strip().lower()
+                if tl in _DENY_LOW or "general" in tl:
+                    continue
+                if _looks_oncall(cand):
+                    oncall_title = cand
+                    break
+
+    if not oncall_title:
+        for cand in titles:
+            tl = cand.strip().lower()
+            if tl in _DENY_LOW or "general" in tl:
+                continue
+            if _looks_oncall(cand):
                 oncall_title = cand
-        else:
-            # Find MC index within the visible sheets list
-            try:
-                idx = next(i for i, w in enumerate(ws_visible) if w.title == mc_title)
-            except StopIteration:
-                idx = -1
-            if idx >= 0:
-                j = idx + 1
-                while j < len(ws_visible):
-                    cand = ws_visible[j].title
-                    if cand.strip().lower() not in _DENY_LOW:
-                        oncall_title = cand
-                        break
-                    j += 1
+                break
 
     if oncall_title:
         out.append(oncall_title)
 
-    # De-dup
     seen, final = set(), []
-    for t in out:
-        if t and t not in seen:
-            seen.add(t); final.append(t)
+    for title in out:
+        if title and title not in seen:
+            seen.add(title)
+            final.append(title)
     return final
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Name matching (handles "OA: Name", "GOA: Name", "Name1 & Name2")
-# ──────────────────────────────────────────────────────────────────────────────
 
 _SPLIT_RE = re.compile(r"[,\n/&+]|(?:\s+\band\b\s+)", re.I)
 _PREFIX_RE = re.compile(r"^\s*(?:OA|GOA|On[-\s]*Call)\s*:\s*", re.I)
 
+
 def _canon(s: str) -> str:
     s = _PREFIX_RE.sub("", s or "")
     return " ".join("".join(ch for ch in s.lower() if ch.isalnum() or ch.isspace()).split())
+
 
 def _cell_mentions_person(cell_value: str, canon_name: str) -> bool:
     if not cell_value:
@@ -156,10 +179,6 @@ def _cell_mentions_person(cell_value: str, canon_name: str) -> bool:
     parts: Iterable[str] = (p.strip() for p in _SPLIT_RE.split(str(cell_value)) if p.strip())
     return any(_canon(p) == target for p in parts)
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# UNH/MC: generic half-hour grid counter (0.5h per matched cell)
-# ──────────────────────────────────────────────────────────────────────────────
 
 def _count_half_hour_grid(ws: gspread.Worksheet, canon_name: str) -> float:
     end_col_letter = a1.rowcol_to_a1(1, ONCALL_MAX_COLS).split("1")[0]
@@ -172,10 +191,6 @@ def _count_half_hour_grid(ws: gspread.Worksheet, canon_name: str) -> float:
     return total
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# On-Call by day headers (Mon–Fri=5h, Sat/Sun=4h, unknown→assume weekday=5h)
-# ──────────────────────────────────────────────────────────────────────────────
-
 _DAY_ALIASES = {
     "monday": "monday", "mon": "monday",
     "tuesday": "tuesday", "tue": "tuesday", "tues": "tuesday",
@@ -185,7 +200,8 @@ _DAY_ALIASES = {
     "saturday": "saturday", "sat": "saturday",
     "sunday": "sunday", "sun": "sunday",
 }
-_WEEKDAYS = {"monday","tuesday","wednesday","thursday","friday"}
+_WEEKDAYS = {"monday", "tuesday", "wednesday", "thursday", "friday"}
+
 
 def _normalize_day(s: str) -> Optional[str]:
     s = (s or "").strip().lower()
@@ -195,6 +211,7 @@ def _normalize_day(s: str) -> Optional[str]:
         if tok in _DAY_ALIASES:
             return _DAY_ALIASES[tok]
     return None
+
 
 def _find_header_row_with_days(values: List[List[str]], max_scan_rows: int = 10) -> Tuple[Optional[int], Dict[int, str]]:
     rows_to_scan = values[:max_scan_rows]
@@ -210,20 +227,19 @@ def _find_header_row_with_days(values: List[List[str]], max_scan_rows: int = 10)
             return r, colmap
     return None, {}
 
+
 def _count_oncall_by_day_headers(ws: gspread.Worksheet, canon_name: str) -> float:
     end_col_letter = a1.rowcol_to_a1(1, ONCALL_MAX_COLS).split("1")[0]
     grid = _safe_batch_get(ws, [f"A1:{end_col_letter}{ONCALL_MAX_ROWS}"])[0] or []
-
     header_r, day_by_col = _find_header_row_with_days(grid)
 
     def weight_for_col(cidx: int) -> float:
         day = day_by_col.get(cidx)
         if not day:
-            return 5.0  # missing/unknown header → weekday weight
+            return 5.0
         return 5.0 if day in _WEEKDAYS else 4.0
 
     total = 0.0
-    # If no header: every mention gets 5h
     if header_r is None:
         for row in grid:
             for cell in (row or []):
@@ -231,7 +247,6 @@ def _count_oncall_by_day_headers(ws: gspread.Worksheet, canon_name: str) -> floa
                     total += 5.0
         return total
 
-    # With header: count below it using column-specific weights
     for r in range(header_r + 1, len(grid)):
         row = grid[r] or []
         for c, cell in enumerate(row, start=1):
@@ -240,111 +255,68 @@ def _count_oncall_by_day_headers(ws: gspread.Worksheet, canon_name: str) -> floa
     return total
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Cache-busting for strict recomputes
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _clear_ws_cache_for_titles(ss: gspread.Spreadsheet, schedule, titles: list[str]) -> None:
-    cache = st.session_state.setdefault("WS_RANGE_CACHE", {})
-    ws_ids = set()
-    for t in titles:
-        try:
-            info = schedule._get_sheet(t)
-            ws_ids.add(getattr(info.ws, "id", info.ws.title))
-        except Exception:
-            try:
-                ws = ss.worksheet(t)
-                ws_ids.add(getattr(ws, "id", ws.title))
-            except Exception:
-                pass
-    for key in list(cache.keys()):
-        ws_id, _ranges = key
-        if ws_id in ws_ids:
-            cache.pop(key, None)
+def _mins_between_12h(start: str, end: str) -> int:
+    try:
+        sd = datetime.strptime(str(start).strip(), "%I:%M %p")
+        ed = datetime.strptime(str(end).strip(), "%I:%M %p")
+    except Exception:
+        return 0
+    if ed <= sd:
+        ed += timedelta(days=1)
+    return int((ed - sd).total_seconds() // 60)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# EXPORTED API (unchanged signatures)
-# ──────────────────────────────────────────────────────────────────────────────
+def _hours_from_user_sched(user_sched: dict) -> float:
+    total_mins = 0
+    for buckets in (user_sched or {}).values():
+        if not isinstance(buckets, dict):
+            continue
+        for key in ("UNH", "MC", "On-Call"):
+            for pair in (buckets.get(key, []) or []):
+                try:
+                    start, end = pair
+                except Exception:
+                    continue
+                total_mins += _mins_between_12h(start, end)
+    return float(total_mins) / 60.0
+
 
 @st.cache_data(show_spinner=False)
-def compute_hours_fast(_ss, _schedule, canon_name: str, epoch: int) -> float:
-    """
-    Cached sidebar metric. Returns **capped** total (max 20).
-    UNH + MC: 0.5h per cell
-    On-Call: 5h per mention in Mon–Fri columns; 4h in Sat/Sun; if no header → 5h.
-    """
+def compute_hours_fast(_ss, _schedule, canon_name: str, epoch) -> float:
     titles = _three_titles_unh_mc_oncall(_ss)
-    if len(titles) < 2:
+    if len(titles) < 1:
         return 0.0
 
-    total_unh = total_mc = total_on = 0.0
+    try:
+        unh_title = titles[0] if len(titles) >= 1 else None
+        mc_title = titles[1] if len(titles) >= 2 else None
+        on_title = titles[2] if len(titles) >= 3 else None
+        user_sched = schedule_query.get_user_schedule_for_titles(
+            _ss,
+            _schedule,
+            canon_name,
+            unh_title=unh_title,
+            mc_title=mc_title,
+            oncall_title=on_title,
+        )
+        h = _hours_from_user_sched(user_sched)
+        if h > 0:
+            return h
 
-    # 1) UNH + MC
+        user_sched2 = schedule_query.get_user_schedule(_ss, _schedule, canon_name)
+        h2 = _hours_from_user_sched(user_sched2)
+        if h2 > 0:
+            return h2
+    except Exception:
+        pass
+
+    total_unh = total_mc = total_on = 0.0
     for idx, label in enumerate(("UNH", "MC")):
         if len(titles) <= idx:
             continue
-        t = titles[idx]
+        title = titles[idx]
         try:
-            ws = _ss.worksheet(t)
-            if _hours_debug_enabled():
-                # slow/raw grid path (useful for one-off diagnostics)
-                subtotal = _count_half_hour_grid(ws, canon_name)
-            else:
-                # fast path via schedule day maps
-                try:
-                    info = _schedule._get_sheet(t)
-                    subtotal = 0.0
-                    for col in info.header_map.values():
-                        day_map = read_day_column_map_cached(info, col, ttl_sec=DAY_CACHE_TTL_SEC)
-                        for v in day_map.values():
-                            if _cell_mentions_person(str(v), canon_name):
-                                subtotal += 0.5
-                except Exception:
-                    subtotal = _count_half_hour_grid(ws, canon_name)
-        except Exception:
-            subtotal = 0.0
-
-        if label == "UNH":
-            total_unh = subtotal
-        else:
-            total_mc = subtotal
-
-    # 2) On-Call (neighbor to MC)
-    if len(titles) >= 3:
-        try:
-            ws_on = _ss.worksheet(titles[2])
-            total_on = _count_oncall_by_day_headers(ws_on, canon_name)
-        except Exception:
-            total_on = 0.0
-
-    total = total_unh + total_mc + total_on
-    # Correct cap to a maximum of 20 hours.
-    return total
-
-
-def invalidate_hours_caches():
-    st.session_state["HOURS_EPOCH"] = st.session_state.get("HOURS_EPOCH", 0) + 1
-
-
-def total_hours_from_unh_mc_and_neighbor(_ss: gspread.Spreadsheet, _schedule, canon_name: str) -> float:
-    """
-    Fresh (non-cached) strict total used for the 20h cap check when adding shifts.
-    Returns the **uncapped** total.
-    """
-    titles = _three_titles_unh_mc_oncall(_ss)
-    _clear_ws_cache_for_titles(_ss, _schedule, titles)
-
-    total_unh = total_mc = total_on = 0.0
-
-    # UNH + MC (fresh)
-    for idx, label in enumerate(("UNH", "MC")):
-        if len(titles) <= idx:
-            continue
-        t = titles[idx]
-        try:
-            ws = _ss.worksheet(t)
-            # In fresh mode, prefer raw grid
+            ws = _ss.worksheet(title)
             subtotal = _count_half_hour_grid(ws, canon_name)
         except Exception:
             subtotal = 0.0
@@ -353,7 +325,63 @@ def total_hours_from_unh_mc_and_neighbor(_ss: gspread.Spreadsheet, _schedule, ca
         else:
             total_mc = subtotal
 
-    # Neighbor (On-Call)
+    if len(titles) >= 3:
+        try:
+            ws_on = _ss.worksheet(titles[2])
+            total_on = _count_oncall_by_day_headers(ws_on, canon_name)
+        except Exception:
+            total_on = 0.0
+
+    return total_unh + total_mc + total_on
+
+
+def invalidate_hours_caches():
+    st.session_state["HOURS_EPOCH"] = st.session_state.get("HOURS_EPOCH", 0) + 1
+
+
+def total_hours_from_unh_mc_and_neighbor(_ss: gspread.Spreadsheet, _schedule, canon_name: str) -> float:
+    titles = _three_titles_unh_mc_oncall(_ss)
+    if len(titles) < 1:
+        return 0.0
+
+    try:
+        unh_title = titles[0] if len(titles) >= 1 else None
+        mc_title = titles[1] if len(titles) >= 2 else None
+        on_title = titles[2] if len(titles) >= 3 else None
+        user_sched = schedule_query.get_user_schedule_for_titles(
+            _ss,
+            _schedule,
+            canon_name,
+            unh_title=unh_title,
+            mc_title=mc_title,
+            oncall_title=on_title,
+        )
+        h = _hours_from_user_sched(user_sched)
+        if h > 0:
+            return h
+
+        user_sched2 = schedule_query.get_user_schedule(_ss, _schedule, canon_name)
+        h2 = _hours_from_user_sched(user_sched2)
+        if h2 > 0:
+            return h2
+    except Exception:
+        pass
+
+    total_unh = total_mc = total_on = 0.0
+    for idx, label in enumerate(("UNH", "MC")):
+        if len(titles) <= idx:
+            continue
+        title = titles[idx]
+        try:
+            ws = _ss.worksheet(title)
+            subtotal = _count_half_hour_grid(ws, canon_name)
+        except Exception:
+            subtotal = 0.0
+        if label == "UNH":
+            total_unh = subtotal
+        else:
+            total_mc = subtotal
+
     if len(titles) >= 3:
         try:
             ws_on = _ss.worksheet(titles[2])

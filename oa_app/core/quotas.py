@@ -3,6 +3,29 @@ import gspread
 import streamlit as st
 import gspread.utils as a1
 
+
+def _ws_id(ws) -> str:
+    return str(getattr(ws, "id", ws.title))
+
+
+def _get_ws_version_map():
+    return st.session_state.setdefault("WS_VER", {})
+
+
+def bump_ws_version(ws) -> None:
+    """Call after any worksheet write/format to invalidate cached reads."""
+    ver = _get_ws_version_map()
+    wid = _ws_id(ws)
+    newv = int(ver.get(wid, 0)) + 1
+    ver[wid] = newv
+    try:
+        title = str(getattr(ws, "title", "") or "").strip()
+        if title:
+            ver[title] = newv
+    except Exception:
+        pass
+
+
 def _safe_batch_get(ws, ranges, *, retries: int = 4, backoff: float = 0.7):
     # self-initialize cache dict
     cache = st.session_state.setdefault("WS_RANGE_CACHE", {})
