@@ -2,7 +2,8 @@
 import time
 import re
 from datetime import datetime, timedelta, date
-from typing import Dict, List, Tuple, Optional, Set
+from typing import Dict, List, Tuple, Optional, Set, Any
+from zoneinfo import ZoneInfo
 import streamlit as st
 import gspread
 import gspread.utils as a1
@@ -30,13 +31,43 @@ from ..core import week_range as week_range_mod
 # 2) Normalize the OA name (case-insensitive substring matching)
 # ──────────────────────────────────────────────────────────────────────────────
 
+_PREFIX_RE = re.compile(r"^\s*(?:OA|GOA|On[-\s]*Call)\s*:\s*", re.I)
+_WEEKDAY_SET = {"monday", "tuesday", "wednesday", "thursday", "friday"}
+_WEEKEND_SET = {"saturday", "sunday"}
+_LA_TZ = ZoneInfo("America/Los_Angeles")
+
+
 def _norm_name(s: str) -> str:
-    return (s or "").strip().lower()
+    s = _PREFIX_RE.sub("", s or "")
+    s = re.sub(r"[^\w\s]", " ", s)
+    return " ".join(s.lower().split())
+
 
 def _cell_has_name(cell: str, name_norm: str) -> bool:
     if not cell or not name_norm:
         return False
-    return name_norm in str(cell).lower()
+    cell_norm = _norm_name(str(cell))
+    if not cell_norm:
+        return False
+    return bool(re.search(rf"(?<!\w){re.escape(name_norm)}(?!\w)", cell_norm))
+
+
+def _coerce_la_datetime(when: Optional[datetime] = None) -> datetime:
+    if when is None:
+        return datetime.now(_LA_TZ)
+    if when.tzinfo is None:
+        return when.replace(tzinfo=_LA_TZ)
+    return when.astimezone(_LA_TZ)
+
+
+def should_show_oncall_now(when: Optional[datetime] = None) -> bool:
+    local = _coerce_la_datetime(when)
+    day_canon = local.strftime("%A").lower()
+    if day_canon in _WEEKEND_SET:
+        return True
+    if day_canon in _WEEKDAY_SET and local.hour >= 19:
+        return True
+    return False
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Day helpers
@@ -52,6 +83,7 @@ _DAY_WORDS = {
     "sunday": "sunday", "sun": "sunday",
 }
 _WEEK_ORDER_7 = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"]
+_MMDD_TOKEN_RE = re.compile(r"(?<!\d)(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?(?!\d)")
 
 def _canon_day_from_header(value: str) -> Optional[str]:
     """
@@ -64,11 +96,111 @@ def _canon_day_from_header(value: str) -> Optional[str]:
     head = s.split(",")[0].strip()
     return _DAY_WORDS.get(head)
 
+
+def _week_bounds_for_grid(title: str) -> Optional[Tuple[date, date]]:
+    try:
+        return week_range_mod.week_range_from_title(str(title or ""), today=week_range_mod.la_today())
+    except Exception:
+        return None
+
+
+def _day_from_date_token(value: str, week_bounds: Optional[Tuple[date, date]]) -> Optional[str]:
+    if not value or not week_bounds:
+        return None
+    ws, we = week_bounds
+    cur = ws
+    day_lookup: Dict[Tuple[int, int], str] = {}
+    while cur <= we:
+        day_lookup[(cur.month, cur.day)] = cur.strftime("%A").lower()
+        cur = cur + timedelta(days=1)
+
+    for match in _MMDD_TOKEN_RE.finditer(str(value)):
+        key = (int(match.group(1)), int(match.group(2)))
+        if key in day_lookup:
+            return day_lookup[key]
+    return None
+
+
+def _day_from_cell(value: str, week_bounds: Optional[Tuple[date, date]] = None) -> Optional[str]:
+    return _canon_day_from_header(value) or _day_from_date_token(value, week_bounds)
+
+
+def _scan_day_columns(
+    grid: List[List[str]],
+    *,
+    week_bounds: Optional[Tuple[date, date]] = None,
+    max_rows: int = 25,
+    max_cols: int = 80,
+) -> Dict[str, int]:
+    best: Dict[str, int] = {}
+    if not grid:
+        return best
+
+    row_limit = min(max_rows, len(grid))
+    for r in range(row_limit):
+        row = grid[r] or []
+        row_map: Dict[str, int] = {}
+        for c, value in enumerate(row[:max_cols]):
+            day = _day_from_cell(value, week_bounds)
+            if day and day not in row_map:
+                row_map[day] = c
+        if len(row_map) > len(best):
+            best = row_map
+            if len(best) >= 5:
+                break
+    return best
+
+
+def _scan_day_hits_anywhere(
+    grid: List[List[str]],
+    *,
+    week_bounds: Optional[Tuple[date, date]] = None,
+    max_rows: int = 60,
+    max_cols: int = 80,
+) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    if not grid:
+        return out
+
+    row_limit = min(max_rows, len(grid))
+    for r in range(row_limit):
+        row = grid[r] or []
+        for c, value in enumerate(row[:max_cols]):
+            day = _day_from_cell(value, week_bounds)
+            if day and day not in out:
+                out[day] = c
+    return out
+
+
+def _infer_oncall_day_columns(
+    grid: List[List[str]],
+    *,
+    week_bounds: Optional[Tuple[date, date]] = None,
+) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    if not grid:
+        return out
+
+    first_range_row_for_col: Dict[int, int] = {}
+    for r, row in enumerate(grid):
+        for c, value in enumerate(row):
+            if _RANGE_RE.match(str(value or "").strip()) and c not in first_range_row_for_col:
+                first_range_row_for_col[c] = r
+
+    for c, r0 in first_range_row_for_col.items():
+        for r in range(r0, max(-1, r0 - 8), -1):
+            value = (grid[r][c] if c < len(grid[r]) else "") or ""
+            day = _day_from_cell(value, week_bounds)
+            if day and day not in out:
+                out[day] = c
+                break
+    return out
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Time parsing + formatting
 # ──────────────────────────────────────────────────────────────────────────────
 
-_TIME_CELL_RE = re.compile(r"^\s*\d{1,2}:\d{2}\s*(?:AM|PM)\s*$", re.I)
+_TIME_CELL_RE = re.compile(r"^\s*\d{1,2}(?::\d{2})?\s*(?:AM|PM)\s*$", re.I)
 _RANGE_RE = re.compile(
     r"^\s*(\d{1,2}:\d{2}\s*(?:AM|PM))\s*[-–]\s*(\d{1,2}:\d{2}\s*(?:AM|PM))\s*$",
     re.I,
@@ -85,6 +217,28 @@ def _fmt(dt: datetime) -> str:
         return dt.strftime("%-I:%M %p")  # POSIX
     except Exception:
         return dt.strftime("%I:%M %p")   # Windows
+
+
+# Override the permissive time parsing from the source app so whole-hour labels
+# like "7 PM" and compact forms like "7:00PM" are handled consistently.
+_TIME_CELL_RE = re.compile(r"^\s*\d{1,2}(?::\d{2})?\s*(?:AM|PM)\s*$", re.I)
+_RANGE_RE = re.compile(
+    r"^\s*(\d{1,2}(?::\d{2})?\s*(?:AM|PM))\s*[-â€“]\s*(\d{1,2}(?::\d{2})?\s*(?:AM|PM))\s*$",
+    re.I,
+)
+
+
+def _parse_time_cell(s: str) -> Optional[datetime]:
+    txt = (s or "").strip()
+    if not txt:
+        return None
+    txt = re.sub(r"\s*(am|pm)\s*$", lambda m: f" {m.group(1).upper()}", txt, flags=re.I)
+    for fmt in ("%I:%M %p", "%I %p"):
+        try:
+            return datetime.strptime(txt, fmt)
+        except Exception:
+            continue
+    return None
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Robust worksheet resolution (handles disconnects)
@@ -232,6 +386,166 @@ def _open_three(ss: gspread.Spreadsheet) -> List[str]:
 # 3) UNH/MC: 30-minute slots → merged ranges (exact algorithm requested)
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _open_three(ss: gspread.Spreadsheet) -> List[str]:
+    unh_cfg, mc_cfg = OA_SCHEDULE_SHEETS[0], OA_SCHEDULE_SHEETS[1]
+    out: List[str] = []
+
+    titles = _cached_ws_titles(getattr(ss, "id", ""))
+
+    def _resolve_from_titles(all_titles: list[str], wanted: str) -> Optional[str]:
+        want = (wanted or "").strip().lower()
+        by_low = {t.strip().lower(): t for t in all_titles}
+        if want in by_low:
+            return by_low[want]
+        first = want.split()[0] if want else ""
+        for t in all_titles:
+            tl = t.strip().lower()
+            if tl == want or (first and tl.startswith(first)):
+                return t
+        return None
+
+    def _looks_oncall(title: str) -> bool:
+        tl = (title or "").lower()
+        return bool(re.search(r"\bon\s*[- ]?\s*call\b", tl)) or ("oncall" in tl) or ("call" in tl and "on" in tl)
+
+    deny = {
+        str(AUDIT_SHEET).strip().lower(),
+        str(LOCKS_SHEET).strip().lower(),
+        str(ROSTER_SHEET).strip().lower(),
+    }
+
+    if titles:
+        unh = _resolve_from_titles(titles, unh_cfg)
+        mc = _resolve_from_titles(titles, mc_cfg)
+        if unh:
+            out.append(unh)
+        if mc:
+            out.append(mc)
+
+        oncall = None
+        if _ONCALL_OVERRIDE and str(_ONCALL_OVERRIDE).strip():
+            cand = _resolve_from_titles(titles, str(_ONCALL_OVERRIDE))
+            if cand and cand.strip().lower() not in deny:
+                oncall = cand
+
+        if not oncall:
+            try:
+                today = week_range_mod.la_today()
+                sunday_offset = (today.weekday() + 1) % 7
+                ws = today - timedelta(days=sunday_offset)
+                we = ws + timedelta(days=6)
+                for cand in titles:
+                    tl = cand.strip().lower()
+                    if tl in deny or "general" in tl or not _looks_oncall(cand):
+                        continue
+                    wr = week_range_mod.week_range_from_title(cand, today=today)
+                    if wr and wr == (ws, we):
+                        oncall = cand
+                        break
+            except Exception:
+                pass
+
+        if not oncall and mc:
+            try:
+                start = titles.index(mc) + 1 if mc in titles else -1
+            except Exception:
+                start = -1
+            if start >= 0:
+                for cand in titles[start:]:
+                    tl = cand.strip().lower()
+                    if tl in deny or "general" in tl:
+                        continue
+                    if _looks_oncall(cand):
+                        oncall = cand
+                        break
+        if not oncall:
+            for cand in titles:
+                tl = cand.strip().lower()
+                if tl in deny or "general" in tl:
+                    continue
+                if _looks_oncall(cand):
+                    oncall = cand
+                    break
+
+        if oncall:
+            out.append(oncall)
+
+        seen, final = set(), []
+        for title in out:
+            if title and title not in seen:
+                seen.add(title)
+                final.append(title)
+        return final
+
+    ws_list = _list_worksheets_with_retry(ss)
+    out = []
+    if ws_list is not None:
+        unh = _resolve_title(ws_list, unh_cfg)
+        mc = _resolve_title(ws_list, mc_cfg)
+        if unh:
+            out.append(unh)
+        if mc:
+            out.append(mc)
+
+        oncall = None
+        if _ONCALL_OVERRIDE and str(_ONCALL_OVERRIDE).strip():
+            cand = _resolve_title(ws_list, str(_ONCALL_OVERRIDE))
+            if cand and cand.strip().lower() not in deny:
+                oncall = cand
+
+        if not oncall:
+            try:
+                today = week_range_mod.la_today()
+                sunday_offset = (today.weekday() + 1) % 7
+                ws = today - timedelta(days=sunday_offset)
+                we = ws + timedelta(days=6)
+                for worksheet in ws_list:
+                    cand = worksheet.title
+                    tl = cand.strip().lower()
+                    if tl in deny or "general" in tl or not _looks_oncall(cand):
+                        continue
+                    wr = week_range_mod.week_range_from_title(cand, today=today)
+                    if wr and wr == (ws, we):
+                        oncall = cand
+                        break
+            except Exception:
+                pass
+
+        if not oncall and mc:
+            try:
+                idx = next(i for i, worksheet in enumerate(ws_list) if worksheet.title == mc)
+            except StopIteration:
+                idx = -1
+            if idx >= 0:
+                for worksheet in ws_list[idx + 1 :]:
+                    cand = worksheet.title
+                    tl = cand.strip().lower()
+                    if tl in deny or "general" in tl:
+                        continue
+                    if _looks_oncall(cand):
+                        oncall = cand
+                        break
+        if not oncall:
+            for worksheet in ws_list:
+                cand = worksheet.title
+                tl = cand.strip().lower()
+                if tl in deny or "general" in tl:
+                    continue
+                if _looks_oncall(cand):
+                    oncall = cand
+                    break
+
+        if oncall:
+            out.append(oncall)
+
+    seen, final = set(), []
+    for title in out:
+        if title and title not in seen:
+            seen.add(title)
+            final.append(title)
+    return final
+
+
 def _read_grid(ws: gspread.Worksheet) -> List[List[str]]:
     end_col_letter = a1.rowcol_to_a1(1, ONCALL_MAX_COLS).split("1")[0]
     return _safe_batch_get(ws, [f"A1:{end_col_letter}{ONCALL_MAX_ROWS}"])[0] or []
@@ -289,6 +603,50 @@ def _unh_mc_intervals(ws: gspread.Worksheet, name_norm: str) -> Dict[str, List[T
                 hits[day].append((start_dt, end_dt))
 
     return hits
+
+def _unh_mc_intervals(ws: gspread.Worksheet, name_norm: str) -> Dict[str, List[Tuple[datetime, datetime]]]:
+    grid = _read_grid(ws)
+    if not grid:
+        return {}
+
+    day_cols = _scan_day_columns(grid)
+    if len(day_cols) < 2:
+        day_cols = _scan_day_hits_anywhere(grid)
+    if not day_cols:
+        return {}
+
+    time_rows: List[int] = []
+    for r, row in enumerate(grid):
+        col0 = (row[0] if len(row) >= 1 else "") or ""
+        if _TIME_CELL_RE.match(col0) and _parse_time_cell(col0):
+            time_rows.append(r)
+
+    if not time_rows:
+        return {}
+
+    time_rows.append(len(grid))
+    hits: Dict[str, List[Tuple[datetime, datetime]]] = {d: [] for d in day_cols}
+    for r0, r1 in zip(time_rows, time_rows[1:]):
+        start_label = (grid[r0][0] if len(grid[r0]) >= 1 else "") or ""
+        start_dt = _parse_time_cell(start_label)
+        if not start_dt:
+            continue
+        end_dt = start_dt + timedelta(minutes=30)
+
+        for day, c in day_cols.items():
+            if c == 0:
+                continue
+            found = False
+            for rr in range(r0 + 1, r1):
+                val = grid[rr][c] if len(grid[rr]) > c else ""
+                if val and _cell_has_name(str(val), name_norm):
+                    found = True
+                    break
+            if found:
+                hits[day].append((start_dt, end_dt))
+
+    return hits
+
 
 def _merge_contiguous(intervals: List[Tuple[datetime, datetime]]) -> List[Tuple[datetime, datetime]]:
     if not intervals:
@@ -362,6 +720,63 @@ def _oncall_blocks(ws: gspread.Worksheet, name_norm: str) -> Dict[str, List[Tupl
 # ──────────────────────────────────────────────────────────────────────────────
 # Public API used by app.py
 # ──────────────────────────────────────────────────────────────────────────────
+
+def _oncall_blocks(ws: gspread.Worksheet, name_norm: str) -> Dict[str, List[Tuple[str, str]]]:
+    grid = _read_grid(ws)
+    if not grid:
+        return {}
+
+    week_bounds = _week_bounds_for_grid(getattr(ws, "title", ""))
+    day_cols = _scan_day_columns(grid, week_bounds=week_bounds, max_rows=15)
+    if len(day_cols) < 2:
+        for day, col in _scan_day_hits_anywhere(grid, week_bounds=week_bounds, max_rows=30).items():
+            day_cols.setdefault(day, col)
+    if len(day_cols) < 2:
+        for day, col in _infer_oncall_day_columns(grid, week_bounds=week_bounds).items():
+            day_cols.setdefault(day, col)
+    if not day_cols:
+        return {}
+
+    per_day: Dict[str, Set[Tuple[str, str]]] = {d: set() for d in day_cols}
+    for day, c in day_cols.items():
+        label_rows: List[int] = []
+        for r in range(len(grid)):
+            col0 = (grid[r][0] if len(grid[r]) > 0 else "") or ""
+            cell = (grid[r][c] if len(grid[r]) > c else "") or ""
+            if _RANGE_RE.match(str(col0).strip()) or _RANGE_RE.match(str(cell).strip()):
+                label_rows.append(r)
+
+        if not label_rows:
+            continue
+        label_rows.append(len(grid))
+
+        for r_label, r_next in zip(label_rows, label_rows[1:]):
+            col0 = (grid[r_label][0] if len(grid[r_label]) > 0 else "") or ""
+            cell = (grid[r_label][c] if len(grid[r_label]) > c else "") or ""
+            range_txt = cell if _RANGE_RE.match(str(cell).strip()) else col0
+            match = _RANGE_RE.match(range_txt) if range_txt else None
+            if not match:
+                continue
+
+            sdt = _parse_time_cell(match.group(1))
+            edt = _parse_time_cell(match.group(2))
+            if not (sdt and edt):
+                continue
+            current_range = (_fmt(sdt), _fmt(edt))
+
+            for rr in range(r_label + 1, r_next):
+                lane_cell = (grid[rr][c] if len(grid[rr]) > c else "") or ""
+                if _cell_has_name(lane_cell, name_norm):
+                    per_day[day].add(current_range)
+                    break
+
+    out: Dict[str, List[Tuple[str, str]]] = {}
+    for d, blocks in per_day.items():
+        sorted_blocks = sorted(blocks, key=lambda ab: _parse_time_cell(ab[0]) or datetime.min)
+        if sorted_blocks:
+            out[d] = list(sorted_blocks)
+    return out
+
 
 def get_user_schedule(ss: gspread.Spreadsheet, _schedule_unused, oa_name: str) -> Dict[str, Dict[str, List[Tuple[str, str]]]]:
     """
