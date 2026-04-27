@@ -71,6 +71,10 @@ CHG_RE = re.compile(
     re.I,
 )
 SWP_RE = re.compile(r"\b(?P<verb>swap|trade)\b.*?" + DAY_RE + r".*?" + RANGE_RE + r".*?with\s+(?P<other>[A-Za-z\-.' ]+)", re.I)
+CVR_RE = re.compile(
+    r"\b(?P<verb>cover|pick\s*up|pickup|take)\b\s+(?:for\s+)?(?P<who>.+?)\s+" + DAY_RE + r".*?" + RANGE_RE,
+    re.I,
+)
 CALLOUT_RE = re.compile(
     r"\b(?P<verb>call\s*-\s*out|callout|call\s+out)\b.*?" + DAY_RE + r".*?" + RANGE_RE,
     re.I,
@@ -143,7 +147,16 @@ def parse_intent(text: str, default_campus: str, default_name: str) -> Intent:
         s, e = _parse_and_infer(m.group("s"), m.group("e"))
         return Intent(kind="callout", campus=campus, day="", start=s, end=e, name=default_name)
 
-    # 3) Change: "change Wed from 9-11 to 11-1"
+    # 3) Cover: "cover Vraj Patel Tue 9-11"
+    m = CVR_RE.search(text)
+    if m:
+        day = _canon_input_day(m.group("day")) or _extract_day_from_text(text) or datetime.today().strftime("%A").lower()
+        s, e = _parse_and_infer(m.group("s"), m.group("e"))
+        who = re.sub(CAMPUS_RE, " ", m.group("who"), flags=re.IGNORECASE)
+        who = re.sub(r"\s+", " ", who).strip(" ,.-")
+        return Intent(kind="cover", campus=campus, day=day, start=s, end=e, name=who or default_name)
+
+    # 4) Change: "change Wed from 9-11 to 11-1"
     m = CHG_RE.search(text)
     if m:
         day = _canon_input_day(m.group("day")) or _extract_day_from_text(text) or datetime.today().strftime("%A").lower()
@@ -152,7 +165,7 @@ def parse_intent(text: str, default_campus: str, default_name: str) -> Intent:
         return Intent(kind="change", campus=campus, day=day, start=new_s, end=new_e, name=default_name,
                       old_start=old_s, old_end=old_e)
 
-    # 4) Swap: "swap Wed 9-11 with Jane"
+    # 5) Swap: "swap Wed 9-11 with Jane"
     m = SWP_RE.search(text)
     if m:
         day = _canon_input_day(m.group("day")) or _extract_day_from_text(text) or datetime.today().strftime("%A").lower()
@@ -160,14 +173,14 @@ def parse_intent(text: str, default_campus: str, default_name: str) -> Intent:
         other = m.group("other").strip()
         return Intent(kind="swap", campus=campus, day=day, start=s, end=e, name=default_name, other_name=other)
 
-    # 5) Implicit add: "Wed 9-11"
+    # 6) Implicit add: "Wed 9-11"
     m = IMPLICIT_ADD_RE.search(text)
     if m:
         day = _canon_input_day(m.group("day")) or _extract_day_from_text(text) or datetime.today().strftime("%A").lower()
         s, e = _parse_and_infer(m.group("s"), m.group("e"))
         return Intent(kind="add", campus=campus, day=day, start=s, end=e, name=default_name)
 
-    # 6) Single-slot add: "add wed 1 pm" (end is implied +30 min)
+    # 7) Single-slot add: "add wed 1 pm" (end is implied +30 min)
     m = SINGLE_ADD_RE.search(text)
     if m:
         # Day may be missing in this pattern → recover from text or default to today
@@ -179,4 +192,4 @@ def parse_intent(text: str, default_campus: str, default_name: str) -> Intent:
         e = e_dt.time()
         return Intent(kind="add", campus=campus, day=day, start=s, end=e, name=default_name)
 
-    raise ValueError("Sorry, I couldn't understand. Examples: 'add Wed 9-11', 'callout Sunday 11-3', 'change Wed from 3-4 to 4-5', 'swap Thu 9-11 with Jane Doe'.")
+    raise ValueError("Sorry, I couldn't understand. Examples: 'add Wed 9-11', 'callout Sunday 11-3', 'cover Vraj Patel Tue 9-11', 'change Wed from 3-4 to 4-5', 'swap Thu 9-11 with Jane Doe'.")
