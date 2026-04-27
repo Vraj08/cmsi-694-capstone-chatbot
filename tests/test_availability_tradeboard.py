@@ -109,6 +109,26 @@ class TradeboardTests(unittest.TestCase):
         self.assertEqual(windows[0].kind, "UNH")
         self.assertEqual((windows[0].end - windows[0].start).total_seconds(), 3600)
 
+    def test_build_adjustment_notes_reads_local_swap_and_callout_rows(self):
+        grid = [
+            ["Time", "Monday", "", "Shift Swaps for the week", "Future Swaps/Call outs"],
+            ["7:00 AM", "", "", "Alex Smith covering Taylor Jones | 04/28 | 2 PM-4 PM | MC", ""],
+            ["7:30 AM", "", "", "", "Alex Smith called out | 04/27 | 9 AM-10:30 AM | UNH | NO COVER"],
+        ]
+        bg = [[None] * 5 for _ in grid]
+
+        with patch.object(pickup_scan, "_fetch_griddata", return_value=(grid, bg)):
+            notes = pickup_scan.build_adjustment_notes(object(), "MC (OA and GOAs)", max_rows=3, max_cols=5)
+
+        self.assertEqual(len(notes), 2)
+        self.assertEqual(notes[0].action, "pickup")
+        self.assertEqual(notes[0].actor_name, "Alex Smith")
+        self.assertEqual(notes[0].target_name, "Taylor Jones")
+        self.assertEqual(notes[0].kind, "MC")
+        self.assertEqual(notes[1].action, "callout")
+        self.assertEqual(notes[1].actor_name, "Alex Smith")
+        self.assertEqual(notes[1].kind, "UNH")
+
 
 if __name__ == "__main__":
     unittest.main()

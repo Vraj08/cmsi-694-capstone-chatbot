@@ -72,6 +72,109 @@ class PickupWindow:
     end: datetime
 
 
+@dataclass(frozen=True)
+class AdjustmentNote:
+    campus_title: str
+    kind: str
+    action: str
+    actor_name: str
+    target_name: str
+    date_label: str
+    start: datetime
+    end: datetime
+    raw_text: str
+
+
+def _clean_note_person(value: str) -> str:
+    s = re.sub(r"\s+", " ", str(value or "").strip(), flags=re.UNICODE).strip()
+    if not s:
+        return ""
+    s = re.sub(r"^\s*(oa|goa)\s*[:\-]?\s*", "", s, flags=re.I)
+    return s.strip()
+
+
+def _kind_from_note(title: str, campus_label: str) -> str:
+    label = str(campus_label or "").lower()
+    if "on call" in label or "on-call" in label:
+        return "ONCALL"
+    if re.search(r"\bmc\b|main", label):
+        return "MC"
+    if re.search(r"\bunh\b", label):
+        return "UNH"
+    merged = str(title or "").lower()
+    if "on call" in merged or "on-call" in merged:
+        return "ONCALL"
+    if re.search(r"\bmc\b|main", merged):
+        return "MC"
+    return "UNH"
+
+
+def _parse_adjustment_note_lines(title: str, cell_txt: str) -> List[AdjustmentNote]:
+    raw = str(cell_txt or "").strip()
+    if not raw or "|" not in raw:
+        return []
+
+    out: List[AdjustmentNote] = []
+    for line in re.split(r"[\r\n]+", raw):
+        txt = line.strip()
+        if not txt or "|" not in txt:
+            continue
+
+        parts = [part.strip() for part in txt.split("|")]
+        if len(parts) < 4:
+            continue
+
+        head = parts[0]
+        date_label = parts[1]
+        range_txt = parts[2]
+        campus_label = parts[3]
+
+        action = ""
+        actor_name = ""
+        target_name = ""
+        if re.search(r"\bcovering\b", head, flags=re.I):
+            names = re.split(r"\bcovering\b", head, maxsplit=1, flags=re.I)
+            if len(names) != 2:
+                continue
+            action = "pickup"
+            actor_name = _clean_note_person(names[0])
+            target_name = _clean_note_person(names[1])
+        elif re.search(r"\bcalled\s+out\b", head, flags=re.I):
+            action = "callout"
+            actor_name = _clean_note_person(re.sub(r"\bcalled\s+out\b.*$", "", head, flags=re.I))
+        else:
+            continue
+
+        if not actor_name or not _MMDD_RE.search(date_label):
+            continue
+
+        match = _RANGE_RE.match(range_txt)
+        if not match:
+            continue
+        start_dt = _parse_time_cell(match.group(1))
+        end_dt = _parse_time_cell(match.group(2))
+        if not start_dt or not end_dt:
+            continue
+        if end_dt <= start_dt:
+            end_dt = end_dt + timedelta(days=1)
+
+        out.append(
+            AdjustmentNote(
+                campus_title=title,
+                kind=_kind_from_note(title, campus_label),
+                action=action,
+                actor_name=actor_name,
+                target_name=target_name,
+                date_label=date_label,
+                start=start_dt,
+                end=end_dt,
+                raw_text=txt,
+            )
+        )
+
+    return out
+
+
 def _rgb(cell: Dict[str, Any]) -> Optional[Dict[str, float]]:
     if not isinstance(cell, dict):
         return None
@@ -686,6 +789,35 @@ def build_callout_windows_oncall(ss, title: str, *, max_rows: int = 900, max_col
     return windows
 
 
+def build_adjustment_notes(ss, title: str, *, max_rows: int = 900, max_cols: int = 24) -> List[AdjustmentNote]:
+    grid, _bg = _fetch_griddata(ss, title, max_rows=max_rows, max_cols=max_cols)
+    if not grid:
+        return []
+
+    out: List[AdjustmentNote] = []
+    seen: set[tuple[str, str, str, str, str, datetime, datetime]] = set()
+    for row in grid:
+        for cell in row:
+            txt = str(cell or "").strip()
+            if "|" not in txt or ("covering" not in txt.lower() and "called out" not in txt.lower()):
+                continue
+            for note in _parse_adjustment_note_lines(title, txt):
+                key = (
+                    note.action,
+                    note.actor_name.lower(),
+                    note.target_name.lower(),
+                    note.date_label,
+                    note.kind,
+                    note.start,
+                    note.end,
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(note)
+    return out
+
+
 @st.cache_data(ttl=15, show_spinner=False)
 def cached_tradeboard(
     ss_id: str,
@@ -753,6 +885,39 @@ def cached_callout_windows(
     }
 
 
+@st.cache_data(ttl=15, show_spinner=False)
+def cached_adjustment_notes(
+    ss_id: str,
+    tab_title: str,
+    version: int,
+    kind: str,
+    *,
+    max_rows: int = 900,
+    max_cols: int = 24,
+) -> Dict[str, Any]:
+    del version, kind
+    ss = st.session_state.get("_SS_HANDLE_BY_ID", {}).get(ss_id)
+    if not ss:
+        return {"notes": []}
+    notes = build_adjustment_notes(ss, tab_title, max_rows=max_rows, max_cols=max_cols)
+    return {
+        "notes": [
+            {
+                "campus_title": note.campus_title,
+                "kind": note.kind,
+                "action": note.action,
+                "actor_name": note.actor_name,
+                "target_name": note.target_name,
+                "date_label": note.date_label,
+                "start": note.start.isoformat(),
+                "end": note.end.isoformat(),
+                "raw_text": note.raw_text,
+            }
+            for note in notes
+        ]
+    }
+
+
 def clear_caches() -> None:
     try:
         cached_tradeboard.clear()  # type: ignore[attr-defined]
@@ -760,5 +925,9 @@ def clear_caches() -> None:
         pass
     try:
         cached_callout_windows.clear()  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    try:
+        cached_adjustment_notes.clear()  # type: ignore[attr-defined]
     except Exception:
         pass

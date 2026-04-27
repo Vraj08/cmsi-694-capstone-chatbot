@@ -32,6 +32,7 @@ from ..core import week_range as week_range_mod
 # ──────────────────────────────────────────────────────────────────────────────
 
 _PREFIX_RE = re.compile(r"^\s*(?:OA|GOA|On[-\s]*Call)\s*:\s*", re.I)
+_ROLE_NAME_RE = re.compile(r"^\s*(OA|GOA|On[-\s]*Call)\s*:\s*(.*?)\s*$", re.I)
 _WEEKDAY_SET = {"monday", "tuesday", "wednesday", "thursday", "friday"}
 _WEEKEND_SET = {"saturday", "sunday"}
 _LA_TZ = ZoneInfo("America/Los_Angeles")
@@ -50,6 +51,56 @@ def _cell_has_name(cell: str, name_norm: str) -> bool:
     if not cell_norm:
         return False
     return bool(re.search(rf"(?<!\w){re.escape(name_norm)}(?!\w)", cell_norm))
+
+
+def _people_from_cell(cell: str) -> List[Dict[str, str]]:
+    raw = str(cell or "").strip()
+    if not raw:
+        return []
+
+    out: List[Dict[str, str]] = []
+    seen: Set[str] = set()
+    for part in re.split(r"[\n;/]+", raw):
+        txt = " ".join(str(part or "").split())
+        if not txt:
+            continue
+
+        role = ""
+        name = txt
+        match = _ROLE_NAME_RE.match(txt)
+        if match:
+            role = match.group(1).upper().replace(" ", "")
+            name = " ".join(str(match.group(2) or "").split())
+
+        key = _norm_name(name)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append({"key": key, "name": name, "role": role})
+    return out
+
+
+def _format_people_ranges(
+    per_day_people: Dict[str, Dict[str, Dict[str, Any]]]
+) -> Dict[str, List[Dict[str, str]]]:
+    out: Dict[str, List[Dict[str, str]]] = {}
+    for day, people in (per_day_people or {}).items():
+        rows: List[Dict[str, str]] = []
+        for info in (people or {}).values():
+            merged = _merge_contiguous(list(info.get("intervals") or []))
+            for start_dt, end_dt in merged:
+                rows.append(
+                    {
+                        "name": str(info.get("name") or "").strip(),
+                        "role": str(info.get("role") or "").strip(),
+                        "start": _fmt(start_dt),
+                        "end": _fmt(end_dt),
+                    }
+                )
+        rows.sort(key=lambda row: (_parse_time_cell(row.get("start", "")) or datetime.min, row.get("name", "")))
+        if rows:
+            out[day] = rows
+    return out
 
 
 def _coerce_la_datetime(when: Optional[datetime] = None) -> datetime:
@@ -776,6 +827,241 @@ def _oncall_blocks(ws: gspread.Worksheet, name_norm: str) -> Dict[str, List[Tupl
         if sorted_blocks:
             out[d] = list(sorted_blocks)
     return out
+
+
+def _unh_mc_people_ranges(ws: gspread.Worksheet) -> Dict[str, List[Dict[str, str]]]:
+    grid = _read_grid(ws)
+    if not grid:
+        return {}
+
+    day_cols = _scan_day_columns(grid)
+    if len(day_cols) < 2:
+        day_cols = _scan_day_hits_anywhere(grid)
+    if not day_cols:
+        return {}
+
+    time_rows: List[int] = []
+    for r, row in enumerate(grid):
+        col0 = (row[0] if len(row) >= 1 else "") or ""
+        if _TIME_CELL_RE.match(col0) and _parse_time_cell(col0):
+            time_rows.append(r)
+
+    if not time_rows:
+        return {}
+
+    time_rows.append(len(grid))
+    per_day_people: Dict[str, Dict[str, Dict[str, Any]]] = {day: {} for day in day_cols}
+
+    for r0, r1 in zip(time_rows, time_rows[1:]):
+        start_label = (grid[r0][0] if len(grid[r0]) >= 1 else "") or ""
+        start_dt = _parse_time_cell(start_label)
+        if not start_dt:
+            continue
+        end_dt = start_dt + timedelta(minutes=30)
+
+        for day, c in day_cols.items():
+            if c == 0:
+                continue
+
+            band_people: Dict[str, Dict[str, str]] = {}
+            for rr in range(r0 + 1, r1):
+                value = grid[rr][c] if len(grid[rr]) > c else ""
+                for person in _people_from_cell(value):
+                    band_people.setdefault(person["key"], person)
+
+            for key, person in band_people.items():
+                entry = per_day_people[day].setdefault(
+                    key,
+                    {
+                        "name": person["name"],
+                        "role": person["role"],
+                        "intervals": [],
+                    },
+                )
+                if not entry.get("role") and person.get("role"):
+                    entry["role"] = person["role"]
+                entry["intervals"].append((start_dt, end_dt))
+
+    return _format_people_ranges(per_day_people)
+
+
+def _oncall_people_ranges(ws: gspread.Worksheet) -> Dict[str, List[Dict[str, str]]]:
+    grid = _read_grid(ws)
+    if not grid:
+        return {}
+
+    week_bounds = _week_bounds_for_grid(getattr(ws, "title", ""))
+    day_cols = _scan_day_columns(grid, week_bounds=week_bounds, max_rows=15)
+    if len(day_cols) < 2:
+        for day, col in _scan_day_hits_anywhere(grid, week_bounds=week_bounds, max_rows=30).items():
+            day_cols.setdefault(day, col)
+    if len(day_cols) < 2:
+        for day, col in _infer_oncall_day_columns(grid, week_bounds=week_bounds).items():
+            day_cols.setdefault(day, col)
+    if not day_cols:
+        return {}
+
+    per_day_people: Dict[str, Dict[str, Dict[str, Any]]] = {day: {} for day in day_cols}
+
+    for day, c in day_cols.items():
+        label_rows: List[int] = []
+        for r in range(len(grid)):
+            col0 = (grid[r][0] if len(grid[r]) > 0 else "") or ""
+            cell = (grid[r][c] if len(grid[r]) > c else "") or ""
+            if _RANGE_RE.match(str(col0).strip()) or _RANGE_RE.match(str(cell).strip()):
+                label_rows.append(r)
+
+        if not label_rows:
+            continue
+        label_rows.append(len(grid))
+
+        for r_label, r_next in zip(label_rows, label_rows[1:]):
+            col0 = (grid[r_label][0] if len(grid[r_label]) > 0 else "") or ""
+            cell = (grid[r_label][c] if len(grid[r_label]) > c else "") or ""
+            range_txt = cell if _RANGE_RE.match(str(cell).strip()) else col0
+            match = _RANGE_RE.match(range_txt) if range_txt else None
+            if not match:
+                continue
+
+            start_dt = _parse_time_cell(match.group(1))
+            end_dt = _parse_time_cell(match.group(2))
+            if not (start_dt and end_dt):
+                continue
+
+            band_people: Dict[str, Dict[str, str]] = {}
+            for rr in range(r_label + 1, r_next):
+                lane_cell = (grid[rr][c] if len(grid[rr]) > c else "") or ""
+                for person in _people_from_cell(lane_cell):
+                    band_people.setdefault(person["key"], person)
+
+            for key, person in band_people.items():
+                entry = per_day_people[day].setdefault(
+                    key,
+                    {
+                        "name": person["name"],
+                        "role": person["role"],
+                        "intervals": [],
+                    },
+                )
+                if not entry.get("role") and person.get("role"):
+                    entry["role"] = person["role"]
+                entry["intervals"].append((start_dt, end_dt))
+
+    return _format_people_ranges(per_day_people)
+
+
+def _time_in_named_window(start_txt: str, end_txt: str, when: datetime) -> bool:
+    start_dt = _parse_time_cell(start_txt)
+    end_dt = _parse_time_cell(end_txt)
+    if not (start_dt and end_dt):
+        return False
+
+    now_min = (when.hour * 60) + when.minute
+    start_min = (start_dt.hour * 60) + start_dt.minute
+    end_min = (end_dt.hour * 60) + end_dt.minute
+
+    if end_min <= start_min:
+        end_min += 24 * 60
+        if now_min < start_min:
+            now_min += 24 * 60
+
+    return start_min <= now_min < end_min
+
+
+def _working_entries_for_day(
+    rows: List[Dict[str, str]],
+    *,
+    source: str,
+    when: datetime,
+) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+    for row in rows or []:
+        start_txt = str(row.get("start") or "").strip()
+        end_txt = str(row.get("end") or "").strip()
+        if not start_txt or not end_txt:
+            continue
+        if not _time_in_named_window(start_txt, end_txt, when):
+            continue
+        out.append(
+            {
+                "source": source,
+                "name": str(row.get("name") or "").strip(),
+                "role": str(row.get("role") or "").strip(),
+                "start": start_txt,
+                "end": end_txt,
+            }
+        )
+    out.sort(key=lambda row: (_parse_time_cell(row.get("start", "")) or datetime.min, row.get("name", "")))
+    return out
+
+
+def get_people_working_now(
+    ss: gspread.Spreadsheet,
+    *,
+    when: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    local_now = _coerce_la_datetime(when)
+    day_canon = local_now.strftime("%A").lower()
+    titles = _open_three(ss)
+    show_oncall = should_show_oncall_now(local_now)
+
+    result: Dict[str, Any] = {
+        "day": day_canon,
+        "display_mode": "oncall" if show_oncall else "campus",
+        "when_local": local_now.isoformat(timespec="minutes"),
+        "when_label": local_now.strftime("%A, %b %d at %I:%M %p").replace(" 0", " "),
+        "entries": [],
+        "sources": [],
+        "sheet_titles": {},
+    }
+
+    if show_oncall:
+        result["sources"] = ["On-Call"]
+        if len(titles) < 3:
+            return result
+        result["sheet_titles"]["On-Call"] = titles[2]
+        try:
+            ws_on = ss.worksheet(titles[2])
+            per_day = _oncall_people_ranges(ws_on)
+            result["entries"] = _working_entries_for_day(
+                per_day.get(day_canon, []),
+                source="On-Call",
+                when=local_now,
+            )
+        except Exception:
+            result["entries"] = []
+        return result
+
+    source_specs = []
+    if len(titles) >= 1:
+        source_specs.append(("UNH", titles[0]))
+    if len(titles) >= 2:
+        source_specs.append(("MC", titles[1]))
+
+    result["sources"] = [src for src, _title in source_specs]
+    for source, title in source_specs:
+        result["sheet_titles"][source] = title
+        try:
+            ws = ss.worksheet(title)
+            per_day = _unh_mc_people_ranges(ws)
+            result["entries"].extend(
+                _working_entries_for_day(
+                    per_day.get(day_canon, []),
+                    source=source,
+                    when=local_now,
+                )
+            )
+        except Exception:
+            continue
+
+    result["entries"].sort(
+        key=lambda row: (
+            result["sources"].index(row.get("source", "")) if row.get("source", "") in result["sources"] else 99,
+            _parse_time_cell(row.get("start", "")) or datetime.min,
+            row.get("name", ""),
+        )
+    )
+    return result
 
 
 def get_user_schedule(ss: gspread.Spreadsheet, _schedule_unused, oa_name: str) -> Dict[str, Dict[str, List[Tuple[str, str]]]]:
